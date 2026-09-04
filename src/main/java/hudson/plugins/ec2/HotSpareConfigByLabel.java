@@ -27,16 +27,17 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import hudson.Extension;
 import hudson.Util;
 import hudson.model.AbstractDescribableImpl;
+import hudson.model.AutoCompletionCandidates;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.labels.LabelAtom;
+import hudson.slaves.Cloud;
 import hudson.util.FormValidation;
-import hudson.util.ListBoxModel;
 import java.io.Serializable;
 import java.util.Set;
 import java.util.TreeSet;
+import jenkins.model.Jenkins;
 import org.jenkinsci.Symbol;
-import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
@@ -200,40 +201,80 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
     @Symbol("hotSpareConfigByLabel")
     public static class DescriptorImpl extends Descriptor<HotSpareConfigByLabel> {
 
+        /** Characters that end one term of a label expression and begin the next. */
+        private static final String LABEL_EXPRESSION_SEPARATORS = " \t&|!()->";
+
         @Override
         public String getDisplayName() {
             return "Hot Spare Rule";
         }
 
         /**
-         * Offers the labels this cloud's templates actually carry. The current value is always
-         * included so a label that has since been removed from every template still round-trips
-         * instead of being silently cleared on save.
+         * Completes the label being typed with the labels the EC2 templates on this controller
+         * carry, plus the labels Jenkins already knows about, since an expression may name anything
+         * a job could ask for.
          */
-        public ListBoxModel doFillLabelItems(@AncestorInPath EC2Cloud cloud, @QueryParameter String label) {
-            ListBoxModel items = new ListBoxModel();
-            Set<String> labels = new TreeSet<>();
-            if (cloud != null) {
-                for (SlaveTemplate template : cloud.getTemplates()) {
-                    for (LabelAtom atom : template.getLabelSet()) {
-                        labels.add(atom.getName());
+        public AutoCompletionCandidates doAutoCompleteLabel(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+            AutoCompletionCandidates candidates = new AutoCompletionCandidates();
+            String typed = termBeingTyped(value);
+            for (String name : knownLabelNames()) {
+                if (name.regionMatches(true, 0, typed, 0, typed.length())) {
+                    candidates.add(name);
+                }
+            }
+            return candidates;
+        }
+
+        /**
+         * @return the part of the field the caret is in, so an expression such as
+         *     {@code linux && } completes its second operand rather than nothing.
+         */
+        private static String termBeingTyped(@CheckForNull String value) {
+            if (value == null) {
+                return "";
+            }
+            int start = 0;
+            for (int i = 0; i < value.length(); i++) {
+                if (LABEL_EXPRESSION_SEPARATORS.indexOf(value.charAt(i)) >= 0) {
+                    start = i + 1;
+                }
+            }
+            return value.substring(start);
+        }
+
+        private static Set<String> knownLabelNames() {
+            Jenkins jenkins = Jenkins.get();
+            Set<String> names = new TreeSet<>();
+            for (Cloud cloud : jenkins.clouds) {
+                if (cloud instanceof EC2Cloud ec2Cloud) {
+                    for (SlaveTemplate template : ec2Cloud.getTemplates()) {
+                        for (LabelAtom atom : template.getLabelSet()) {
+                            names.add(atom.getName());
+                        }
                     }
                 }
             }
-            String current = Util.fixEmptyAndTrim(label);
-            if (current != null) {
-                labels.add(current);
+            for (LabelAtom atom : jenkins.getLabelAtoms()) {
+                names.add(atom.getName());
             }
-            for (String name : labels) {
-                items.add(name, name);
-            }
-            return items;
+            return names;
         }
 
         @POST
         public FormValidation doCheckLabel(@QueryParameter String value) {
-            if (Util.fixEmptyAndTrim(value) == null) {
+            String label = Util.fixEmptyAndTrim(value);
+            if (label == null) {
                 return FormValidation.error("A label is required");
+            }
+            try {
+                Label.parseExpression(label);
+            } catch (IllegalArgumentException e) {
+                /*
+                 * Jenkins falls back to treating an unparseable expression as a single label atom,
+                 * which no template can carry, so the rule would quietly govern nothing.
+                 */
+                return FormValidation.error("Not a valid label or label expression: " + e.getMessage());
             }
             return FormValidation.ok();
         }

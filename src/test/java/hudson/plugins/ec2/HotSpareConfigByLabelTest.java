@@ -1,15 +1,20 @@
 package hudson.plugins.ec2;
 
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItems;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import hudson.model.Node;
+import hudson.util.FormValidation;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
+import org.htmlunit.html.HtmlPage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -204,32 +209,83 @@ class HotSpareConfigByLabelTest {
     }
 
     /**
-     * The rule's label drop-down offers the labels this cloud's templates carry, and keeps the
-     * configured value even after no template carries it any more.
+     * The rules are configured above the AMIs they draw on, and the label is a text field wired to
+     * the completion endpoint rather than a drop-down.
      */
     @Test
-    void testLabelItemsComeFromThisCloudsTemplates() {
-        EC2Cloud cloud = cloud(null, template("30", 0), templateWithLabels("30", 0, "windows"));
+    void testTheFormPutsTheRulesBeforeTheAmisAndTypesTheLabel() throws Exception {
+        EC2Cloud cloud = cloud(new HotSpareConfigByLabel(LABEL), template("30", 0));
+        r.jenkins.clouds.add(cloud);
+
+        HtmlPage page = r.createWebClient().goTo(cloud.getUrl() + "configure");
+        String html = page.getWebResponse().getContentAsString();
+
+        assertThat(
+                "the hot spare rules should come before the list of AMIs",
+                html.indexOf("Hot spares by label"),
+                lessThan(html.indexOf("List of AMIs to be launched as agents")));
+        assertThat(html, containsString("autoCompleteLabel"));
+        assertThat(
+                "the label should be typed, so it is an input rather than a select",
+                page.getFormByName("config").getInputByName("_.label").getAttribute("type"),
+                equalTo("text"));
+    }
+
+    /**
+     * The field is free text, so it carries an expression that no drop-down could have offered.
+     */
+    @Test
+    void testALabelExpressionSurvivesAConfigurationFormRoundtrip() throws Exception {
+        String expression = LABEL + " && gpu";
+        EC2Cloud cloud = cloud(new HotSpareConfigByLabel(expression), template("30", 0));
+        r.jenkins.clouds.add(cloud);
+
+        r.submit(r.createWebClient().goTo(cloud.getUrl() + "configure").getFormByName("config"));
+
+        assertThat(
+                r.jenkins
+                        .clouds
+                        .get(EC2Cloud.class)
+                        .getHotSpareConfigsByLabel()
+                        .get(0)
+                        .getLabel(),
+                equalTo(expression));
+    }
+
+    /**
+     * The label is typed rather than picked, so the field completes it from the labels the
+     * configured templates carry, including part way through an expression.
+     */
+    @Test
+    void testLabelCompletesFromTheConfiguredTemplates() {
+        r.jenkins.clouds.add(cloud(null, template("30", 0), templateWithLabels("30", 0, "windows")));
         HotSpareConfigByLabel.DescriptorImpl descriptor =
                 r.jenkins.getDescriptorByType(HotSpareConfigByLabel.DescriptorImpl.class);
 
+        assertThat(descriptor.doAutoCompleteLabel("").getValues(), hasItems(LABEL, "windows"));
+        assertThat(descriptor.doAutoCompleteLabel("wind").getValues(), equalTo(List.of("windows")));
         assertThat(
-                descriptor.doFillLabelItems(cloud, null).stream()
-                        .map(item -> item.value)
-                        .collect(Collectors.toList()),
-                equalTo(List.of(LABEL, "windows")));
-        assertThat(
-                "a label no template carries any more must still round-trip",
-                descriptor.doFillLabelItems(cloud, "retired").stream()
-                        .map(item -> item.value)
-                        .collect(Collectors.toList()),
-                equalTo(List.of("retired", LABEL, "windows")));
-        assertThat(
-                "no cloud in scope must not fail the form",
-                descriptor.doFillLabelItems(null, LABEL).stream()
-                        .map(item -> item.value)
-                        .collect(Collectors.toList()),
-                equalTo(List.of(LABEL)));
+                "the term after an operator is the one being completed",
+                descriptor.doAutoCompleteLabel(LABEL + " && wind").getValues(),
+                equalTo(List.of("windows")));
+        assertThat(descriptor.doAutoCompleteLabel("nosuchlabel").getValues(), empty());
+    }
+
+    /**
+     * A label expression is a valid value, but something that cannot be parsed as one is not:
+     * Jenkins would fall back to treating it as a single label atom, which no template can carry,
+     * and the rule would silently govern nothing.
+     */
+    @Test
+    void testLabelExpressionsAreAcceptedAndUnparseableValuesAreNot() {
+        HotSpareConfigByLabel.DescriptorImpl descriptor =
+                r.jenkins.getDescriptorByType(HotSpareConfigByLabel.DescriptorImpl.class);
+
+        assertThat(descriptor.doCheckLabel(LABEL).kind, equalTo(FormValidation.Kind.OK));
+        assertThat(descriptor.doCheckLabel(LABEL + " && gpu").kind, equalTo(FormValidation.Kind.OK));
+        assertThat(descriptor.doCheckLabel("!windows").kind, equalTo(FormValidation.Kind.OK));
+        assertThat(descriptor.doCheckLabel("  ").kind, equalTo(FormValidation.Kind.ERROR));
+        assertThat(descriptor.doCheckLabel(LABEL + " &&").kind, equalTo(FormValidation.Kind.ERROR));
     }
 
     @Test
