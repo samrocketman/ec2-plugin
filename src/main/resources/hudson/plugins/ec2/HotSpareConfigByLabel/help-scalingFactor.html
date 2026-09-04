@@ -3,20 +3,21 @@
     label; it holds however many recent load suggests it needs, and this is the size of each step
     up or down.</p>
 
-    <p>With a step of 5, a label that goes from quiet to busy aims for 5 spares. If builds keep
-    arriving faster than those spares and the instances already booting can absorb them, the target
-    grows to 10, then 15, then 20, until the spares keep up. It then stays at that level for as
-    long as the label has work.</p>
+    <p>With a step of 5, the first build to take an executor for the label brings the target to 5
+    spares. If builds keep taking the last of them, or keep arriving faster than the spares and the
+    instances already booting can absorb, the target grows to 10, then 15, then 20, until the spares
+    keep up. It then stays at that level for as long as the label has work.</p>
 
     <p>The target comes back down by the same step: once for every spare that sits unused for a
     whole <i>Idle termination time</i>, and once per idle termination time while nothing at all is
     asking for the label. That drains the label to <i>Base hot spares</i> &mdash; zero by default
     &mdash; so an idle Jenkins pays for nothing.</p>
 
-    <p>Spares taken by builds are replaced on the next pass, because a busy agent is not a spare.
-    Instances already booting count towards the target, so a growing queue does not provision the
-    same shortfall repeatedly, and the target only takes one step per minute however often the
-    check runs.</p>
+    <p>A spare taken by a build is replaced the moment its executor is taken, because a busy agent
+    is not a spare: the replacement boots while that build runs, which is what keeps the label warm
+    for the build behind it. Instances already booting count towards the target, so a growing queue
+    does not provision the same shortfall repeatedly, and the target only takes one step per minute
+    however often builds start.</p>
 
     <p><i>Maximum hot spares</i> caps how far the target can grow and is the setting to use if the
     cost of an unexpected burst matters.</p>

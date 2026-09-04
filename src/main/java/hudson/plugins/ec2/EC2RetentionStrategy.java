@@ -383,14 +383,46 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
      */
     private static void noteReclaimedSpare(EC2Computer computer) {
         EC2Cloud cloud = cloudOf(computer);
-        SlaveTemplate template = computer.getSlaveTemplate();
-        if (cloud == null || template == null) {
+        if (cloud == null) {
+            return;
+        }
+        SlaveTemplate template = templateOf(computer);
+        if (template == null) {
             return;
         }
         for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
             if (config.matches(template)) {
                 HotSpareDemand.spareReclaimed(cloud, config);
             }
+        }
+    }
+
+    /**
+     * Tells the hot spare prediction that this agent has just stopped being a spare, and asks for a
+     * replacement to be provisioned now rather than at the next periodic pass.
+     *
+     * <p>Only the bookkeeping happens here. Provisioning is left to
+     * {@link MinimumInstanceChecker#scheduleCheck()} because this runs on the executor thread, which
+     * is no place to wait on EC2.
+     */
+    private static void noteConsumedSpare(EC2Computer computer) {
+        EC2Cloud cloud = cloudOf(computer);
+        if (cloud == null) {
+            return;
+        }
+        SlaveTemplate template = templateOf(computer);
+        if (template == null) {
+            return;
+        }
+        boolean matched = false;
+        for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
+            if (config.matches(template)) {
+                HotSpareDemand.spareConsumed(cloud, config);
+                matched = true;
+            }
+        }
+        if (matched) {
+            MinimumInstanceChecker.scheduleCheck();
         }
     }
 
@@ -433,6 +465,21 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
         }
         SlaveTemplate template = computer.getSlaveTemplate();
         return template == null || template.isDiscardAfterGracePeriod();
+    }
+
+    /**
+     * The agent's template, or null for an agent whose cloud or template no longer exists. Resolving
+     * one goes through the cloud, so an agent left behind by a configuration change can fail here
+     * and must not take a build start down with it.
+     */
+    @CheckForNull
+    private static SlaveTemplate templateOf(EC2Computer computer) {
+        try {
+            return computer.getSlaveTemplate();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.FINE, "Template not resolvable for " + computer.getName(), e);
+            return null;
+        }
     }
 
     @CheckForNull
@@ -552,6 +599,7 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
     public void taskAccepted(Executor executor, Queue.Task task) {
         EC2Computer computer = (EC2Computer) executor.getOwner();
         if (computer != null) {
+            noteConsumedSpare(computer);
             EC2AbstractSlave slaveNode = computer.getNode();
             if (slaveNode != null) {
                 int maxTotalUses = slaveNode.maxTotalUses;

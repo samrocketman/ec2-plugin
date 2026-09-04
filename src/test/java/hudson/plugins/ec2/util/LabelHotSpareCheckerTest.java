@@ -2,7 +2,9 @@ package hudson.plugins.ec2.util;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
 
+import hudson.model.Executor;
 import hudson.model.FreeStyleProject;
 import hudson.model.Label;
 import hudson.model.Node;
@@ -11,6 +13,7 @@ import hudson.plugins.ec2.ConnectionStrategy;
 import hudson.plugins.ec2.EC2AbstractSlave;
 import hudson.plugins.ec2.EC2Cloud;
 import hudson.plugins.ec2.EC2Computer;
+import hudson.plugins.ec2.EC2RetentionStrategy;
 import hudson.plugins.ec2.EbsEncryptRootVolume;
 import hudson.plugins.ec2.HotSpareConfigByLabel;
 import hudson.plugins.ec2.HotSpareDemand;
@@ -210,6 +213,64 @@ class LabelHotSpareCheckerTest {
 
         assertThat(countAgents(), equalTo(3));
         assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(3));
+    }
+
+    /**
+     * The other half of the reported defect: even with the right target, waiting for the next
+     * periodic pass leaves the pool a spare short for up to a minute after every build starts. A
+     * build taking an executor is what has to start the replacement, so the spare is booting while
+     * that build runs rather than after the build behind it has already had to wait.
+     */
+    @Test
+    void testTakingAnExecutorStartsTheNextSpareStraightAway() throws Exception {
+        HotSpareConfigByLabel rule = rule(0, 2, null);
+        SlaveTemplate template = template("only", 20);
+        template.setAvoidUsingOrphanedNodes(true);
+        EC2Cloud cloud = cloud(rule, template);
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+        assertThat("a label nobody is using costs nothing", countAgents(), equalTo(0));
+
+        // A build lands on the agent Jenkins raised for it and takes its executor.
+        cloud.provision(template, 1);
+        EC2Computer computer = onlyAgent();
+        int launchedBefore = AmazonEC2FactoryMockImpl.instances.size();
+        retentionStrategyOf(computer).taskAccepted(new Executor(computer, 0), null);
+
+        /*
+         * Nothing else has happened: no queued build, no periodic pass, and the clock has not moved.
+         * The agent above still reports itself idle because no real build runs in this harness, so
+         * it counts as one of the two spares the label now wants and one more is launched.
+         */
+        waitForInstanceCount(launchedBefore + 1);
+        assertThat(countAgents(), equalTo(2));
+        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(2));
+    }
+
+    /**
+     * The replacement is provisioned off the executor thread, so it is not there the instant
+     * {@code taskAccepted} returns.
+     */
+    private static void waitForInstanceCount(int expected) throws Exception {
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
+        while (AmazonEC2FactoryMockImpl.instances.size() < expected && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
+        assertThat(AmazonEC2FactoryMockImpl.instances.size(), equalTo(expected));
+    }
+
+    private static EC2Computer onlyAgent() {
+        return Arrays.stream(Jenkins.get().getComputers())
+                .filter(EC2Computer.class::isInstance)
+                .map(EC2Computer.class::cast)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no EC2 agent was provisioned"));
+    }
+
+    private static EC2RetentionStrategy retentionStrategyOf(EC2Computer computer) {
+        EC2AbstractSlave node = computer.getNode();
+        assertThat(node, notNullValue());
+        return (EC2RetentionStrategy) node.getRetentionStrategy();
     }
 
     private void removeAllAgents() throws Exception {

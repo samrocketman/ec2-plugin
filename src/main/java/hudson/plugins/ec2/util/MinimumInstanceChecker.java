@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -49,11 +50,33 @@ public class MinimumInstanceChecker {
     });
 
     /**
+     * Set while a check is queued but has not started reading the state of Jenkins yet.
+     */
+    private static final AtomicBoolean CHECK_QUEUED = new AtomicBoolean();
+
+    /**
      * Schedules a minimum-instance check to run asynchronously. Use this instead of
      * {@link #checkForMinimumInstances()} when the caller must return immediately (e.g. taskAccepted).
+     *
+     * <p>Requests that arrive while one is already waiting are dropped: the queued check has not
+     * looked at Jenkins yet, so it will see everything they would have asked about. Without this, a
+     * burst of builds starting at once would queue one redundant pass per build behind the single
+     * checker thread.
      */
     public static void scheduleCheck() {
-        EXECUTOR.execute(MinimumInstanceChecker::checkForMinimumInstances);
+        if (!CHECK_QUEUED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            EXECUTOR.execute(() -> {
+                CHECK_QUEUED.set(false);
+                checkForMinimumInstances();
+            });
+        } catch (RuntimeException e) {
+            // Jenkins is shutting down. Leaving the flag set would silence every later request.
+            CHECK_QUEUED.set(false);
+            throw e;
+        }
     }
 
     @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "Needs to be overridden from tests")
@@ -248,11 +271,14 @@ public class MinimumInstanceChecker {
      * {@link SlaveTemplate#getMinimumNumberOfSpareInstances()} no longer applies to the templates
      * the rule covers.
      *
-     * <p>Only idle agents count towards the target, so a spare taken by a build is replaced on the
-     * next pass and the label stays warm for the whole of a busy period instead of draining with
-     * the first few builds. Instances already on their way are subtracted as well, otherwise every
-     * pass would re-provision the same shortfall while the previous batch is still booting.
-     * {@link HotSpareDemand} decides what the target itself should be.
+     * <p>Only idle agents count towards the target, so a spare taken by a build is a shortfall to be
+     * replaced, which is what keeps a label warm for the whole of a busy period instead of draining
+     * with the first few builds. Taking an executor schedules this pass
+     * ({@link hudson.plugins.ec2.EC2RetentionStrategy#taskAccepted}), so the replacement launches
+     * while the build that took the spare is still starting. Instances already on their way are
+     * subtracted as well, otherwise every pass would re-provision the same shortfall while the
+     * previous batch is still booting. {@link HotSpareDemand} decides what the target itself
+     * should be.
      */
     private static void checkForLabelHotSpares(@NonNull EC2Cloud cloud) {
         for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {

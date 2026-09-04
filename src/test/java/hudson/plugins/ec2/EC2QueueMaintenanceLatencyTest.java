@@ -196,8 +196,10 @@ class EC2QueueMaintenanceLatencyTest {
 
     private EC2Cloud cloud(HotSpareConfigByLabel rule, SlaveTemplate... templates) throws Exception {
         SSHCredentialHelper.assureSshCredentialAvailableThroughCredentialProviders("ghi");
+        // Caps well clear of anything these tests provision: a cap reached would let provisioning
+        // return without an EC2 call, and the control below needs it to make one.
         EC2Cloud cloud =
-                new EC2Cloud("test-cloud", true, "abc", "us-east-1", null, "ghi", "20", List.of(templates), null, null);
+                new EC2Cloud("test-cloud", true, "abc", "us-east-1", null, "ghi", "100", List.of(templates), null, null);
         cloud.setRoundRobinTemplatesByLabel(true);
         cloud.setHotSpareConfigsByLabel(List.of(rule));
         r.jenkins.clouds.add(cloud);
@@ -230,7 +232,7 @@ class EC2QueueMaintenanceLatencyTest {
                 null,
                 0,
                 0,
-                "5",
+                "50",
                 null,
                 false,
                 false,

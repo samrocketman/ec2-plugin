@@ -42,11 +42,16 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * burst arrives, so the number is treated as a load prediction that follows demand:
  *
  * <ul>
+ *   <li>an executor being taken is the signal that drives the whole thing. It says the label is in
+ *       use and that the pool just lost a spare, so the replacement is provisioned there and then
+ *       rather than at the next periodic pass. A label being used holds at least one step of
+ *       spares, which is how a label warms up from nothing without waiting for builds to pile up;
  *   <li>every spare taken by a build is replaced, because a busy agent is not a spare. This is what
- *       keeps a label warm for the whole of a build rather than for the first few;
- *   <li>when builds are waiting that neither the spares nor the instances already on their way can
- *       take, the target grows by {@link HotSpareConfigByLabel#getScalingFactor()}, so a label that
- *       cannot keep up climbs 5, 10, 15, 20 until it does;
+ *       keeps a label warm for the whole of a busy period rather than for the first few builds;
+ *   <li>when the pool runs dry anyway, or builds are waiting that neither the spares nor the
+ *       instances already on their way can take, the target grows by
+ *       {@link HotSpareConfigByLabel#getScalingFactor()}, so a label that cannot keep up climbs 5,
+ *       10, 15, 20 until it does;
  *   <li>while builds are running or queued the target is held, so a label that has found its level
  *       stays there;
  *   <li>growth stops at the work in sight, so a label whose instance caps are already reached
@@ -85,6 +90,9 @@ public final class HotSpareDemand {
     /** When the label was first seen with nothing to do, or 0 while it has work. */
     private long quietSinceMillis;
 
+    /** Spares taken by builds since the last pass, counted by {@link #spareConsumed}. */
+    private int consumedSinceLastPass;
+
     private HotSpareDemand() {}
 
     public static HotSpareDemand of(@NonNull EC2Cloud cloud, @NonNull String label) {
@@ -113,35 +121,50 @@ public final class HotSpareDemand {
         final int base = config.getBaseHotSpares();
         final int step = growthStep(config);
         final long now = clock.millis();
+        final int consumed = consumedSinceLastPass;
+        consumedSinceLastPass = 0;
 
         target = Math.max(target, base);
 
         /*
-         * Waiting builds that nothing warm and nothing in flight can take are the signal that the
-         * spares are not keeping up. Counting what is in flight is what makes the loop settle: a
-         * burst grows the target once per interval until the instances already coming cover it.
+         * Two things say the spares are not keeping up: builds took the last of the pool, and builds
+         * are waiting that neither the spares nor the instances already on their way can take.
+         * Counting what is in flight is what makes the loop settle, so a burst grows the target once
+         * per interval until the instances already coming cover it.
          */
-        boolean notKeepingUp = queued > spares + provisioning;
-        boolean hasWork = queued > 0 || busy > 0;
+        boolean ranDry = consumed > 0 && spares == 0;
+        boolean queueUnserved = queued > spares + provisioning;
+        boolean inUse = consumed > 0 || busy > 0 || queued > 0;
 
-        if (notKeepingUp) {
+        if (inUse) {
             quietSinceMillis = 0;
+        }
+
+        if (consumed > 0 && target < step) {
+            /*
+             * The label has started being used, so it should be holding spares. Warming up to one
+             * step counts as this round's growth: going from quiet to busy should not jump two steps
+             * just because the first build also found the pool empty.
+             */
+            LOGGER.log(Level.FINE, "Label {0} is in use again, warming up to {1} spare(s)", new Object[] {
+                config.getLabel(), step
+            });
+            target = Math.min(ceiling(config), step);
+            lastGrowthMillis = now;
+        } else if (ranDry || queueUnserved) {
             if (now - lastGrowthMillis >= GROWTH_INTERVAL_MS) {
                 lastGrowthMillis = now;
                 int grown = Math.min(Math.min(ceiling(config), demandCeiling(config, queued, busy)), target + step);
                 if (grown > target) {
                     LOGGER.log(
                             Level.FINE,
-                            "Hot spares for {0} are not keeping up with {1} queued build(s), "
-                                    + "raising the target from {2} to {3}",
-                            new Object[] {config.getLabel(), queued, target, grown});
+                            "Hot spares for {0} are not keeping up ({1} taken, {2} left, {3} queued), "
+                                    + "raising the target from {4} to {5}",
+                            new Object[] {config.getLabel(), consumed, spares, queued, target, grown});
                     target = grown;
                 }
             }
-        } else if (hasWork) {
-            // Builds are being served: this is the level the label needs, so stay there.
-            quietSinceMillis = 0;
-        } else {
+        } else if (!inUse) {
             if (quietSinceMillis == 0) {
                 quietSinceMillis = now;
             } else if (now - quietSinceMillis >= decayIntervalMillis(config)) {
@@ -152,6 +175,27 @@ public final class HotSpareDemand {
 
         target = Math.min(target, ceiling(config));
         return target;
+    }
+
+    /**
+     * Reports that a build has taken an executor on an agent of this label, which is both the
+     * signal that the label is in use and the moment its pool of spares got one smaller.
+     *
+     * <p>Callers follow this with {@link hudson.plugins.ec2.util.MinimumInstanceChecker#scheduleCheck()}
+     * so the replacement is on its way while the build that took the spare is still starting, which
+     * is the point of the whole feature: the next build finds somewhere warm to land instead of
+     * waiting for an instance to boot.
+     */
+    public static void spareConsumed(@NonNull EC2Cloud cloud, @NonNull HotSpareConfigByLabel config) {
+        String label = config.getLabel();
+        if (label == null) {
+            return;
+        }
+        HotSpareDemand demand = of(cloud, label);
+        synchronized (demand) {
+            demand.consumedSinceLastPass++;
+            demand.quietSinceMillis = 0;
+        }
     }
 
     /**
