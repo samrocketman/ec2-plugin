@@ -125,6 +125,49 @@ class HotSpareDemandTest {
     }
 
     /**
+     * One build taking spare after spare is not evidence of five builds' worth of demand, however
+     * long it goes on for. Growth stops one step above the work actually in sight, so a saturated
+     * label tracks its concurrency plus a step of cover rather than climbing without limit.
+     */
+    @Test
+    void testOneBuildCannotClimbBeyondAStepOfHeadroom() {
+        HotSpareConfigByLabel config = rule(0, 5, null);
+        HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
+        HotSpareDemand.spareConsumed(cloud, config);
+        assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
+
+        for (int minute = 0; minute < 10; minute++) {
+            clock.advanceMinutes(1);
+            HotSpareDemand.spareConsumed(cloud, config);
+            demand.updateTarget(config, 0, 5, 0, 1);
+        }
+
+        assertThat("one busy agent plus a step of cover", demand.getTarget(), equalTo(6));
+    }
+
+    /**
+     * Five builds of the same job saturating the label is real demand, so the target follows it,
+     * but still only as far as that demand plus a step.
+     */
+    @Test
+    void testConcurrentBuildsGrowTheTargetOnlyAsFarAsTheirOwnNumberPlusAStep() {
+        HotSpareConfigByLabel config = rule(0, 5, null);
+        HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
+        HotSpareDemand.spareConsumed(cloud, config);
+        assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
+
+        for (int minute = 0; minute < 10; minute++) {
+            clock.advanceMinutes(1);
+            for (int taken = 0; taken < 5; taken++) {
+                HotSpareDemand.spareConsumed(cloud, config);
+            }
+            demand.updateTarget(config, 0, 5, 0, 5);
+        }
+
+        assertThat("five busy agents plus a step of cover", demand.getTarget(), equalTo(10));
+    }
+
+    /**
      * Spares being taken while others stay warm is exactly what the label is meant to do, so the
      * target holds instead of climbing.
      */
