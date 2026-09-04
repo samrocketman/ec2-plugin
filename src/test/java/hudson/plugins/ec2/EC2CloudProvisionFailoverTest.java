@@ -14,6 +14,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -86,6 +87,34 @@ class EC2CloudProvisionFailoverTest {
     }
 
     /**
+     * With the default configuration the exhausted template is tried first on every cycle, since
+     * nothing demotes it. Each cycle must still end with an instance from the second template
+     * rather than looping on the first one.
+     */
+    @Test
+    void testEveryRequestStillDeliversWhileTheFirstTemplateKeepsFailing() throws Exception {
+        failRunInstancesFor(FIRST_TYPE, () -> capacityException("InsufficientInstanceCapacity"));
+        SlaveTemplate first = template("first", FIRST_TYPE);
+        SlaveTemplate second = template("second", SECOND_TYPE);
+        EC2Cloud cloud = cloud(false, first, second);
+
+        cloud.provision(Label.get(LABEL), 1);
+        awaitInstanceCount(1);
+        cloud.provision(Label.get(LABEL), 1);
+        awaitInstanceCount(2);
+
+        assertThat(
+                AmazonEC2FactoryMockImpl.instances.stream()
+                        .map(instance -> instance.instanceTypeAsString())
+                        .collect(Collectors.toList()),
+                equalTo(List.of(SECOND_TYPE.toString(), SECOND_TYPE.toString())));
+        assertThat(
+                "the configured order is unchanged, so the exhausted template leads again",
+                cloud.orderTemplatesForLabel(Label.get(LABEL), List.of(first, second)),
+                equalTo(List.of(first, second)));
+    }
+
+    /**
      * A failure that is not about capacity also falls over to the next template, but must not put
      * the first one into a capacity cooldown.
      */
@@ -123,6 +152,19 @@ class EC2CloudProvisionFailoverTest {
                 .build();
     }
 
+    private void awaitInstanceCount(int expected) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
+        while (System.currentTimeMillis() < deadline) {
+            if (AmazonEC2FactoryMockImpl.instances.size() >= expected) {
+                return;
+            }
+            Thread.sleep(100);
+        }
+        assertTrue(
+                false,
+                "only " + AmazonEC2FactoryMockImpl.instances.size() + " of " + expected + " instances were launched");
+    }
+
     private void awaitInstanceOfType(InstanceType type) throws InterruptedException {
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
         while (System.currentTimeMillis() < deadline) {
@@ -145,7 +187,7 @@ class EC2CloudProvisionFailoverTest {
     }
 
     private static SlaveTemplate template(String description, InstanceType type) {
-        return new SlaveTemplate(
+        SlaveTemplate template = new SlaveTemplate(
                 "ami-" + description,
                 EC2AbstractSlave.TEST_ZONE,
                 null,
@@ -191,5 +233,12 @@ class EC2CloudProvisionFailoverTest {
                 EC2AbstractSlave.DEFAULT_METADATA_HOPS_LIMIT,
                 EC2AbstractSlave.DEFAULT_METADATA_SUPPORTED,
                 EC2AbstractSlave.DEFAULT_ENCLAVE_ENABLED);
+        /*
+         * The mocked describe-instances ignores filters, so without this a later request would find
+         * the instance an earlier one launched, treat it as an orphan and reuse it instead of
+         * exercising the failover.
+         */
+        template.setAvoidUsingOrphanedNodes(true);
+        return template;
     }
 }
