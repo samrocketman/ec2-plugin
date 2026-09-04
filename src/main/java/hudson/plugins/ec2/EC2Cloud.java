@@ -1252,7 +1252,12 @@ public class EC2Cloud extends Cloud {
                 number = possibleSlavesCount;
             }
 
-            return t.provision(number, provisionOptions);
+            List<EC2AbstractSlave> slaves = t.provision(number, provisionOptions);
+            if (slaves != null && !slaves.isEmpty()) {
+                // As in provisionFromTemplate: commit the count before the next caller can read it.
+                invalidateInstanceCountCache();
+            }
+            return slaves;
         } finally {
             slaveCountingLock.unlock();
         }
@@ -1431,7 +1436,13 @@ public class EC2Cloud extends Cloud {
     /**
      * Provisions up to {@code number} instances from a single template, respecting its instance cap.
      *
+     * <p>The cached instance counts are dropped while the counting lock is still held once a launch
+     * has been committed, so a request that arrives moments later re-reads the count from EC2
+     * instead of the one cached before either request launched anything. Two concurrent requests
+     * would otherwise both pass the same cap.
+     *
      * @return the provisioned agents, or {@code null} if the template is at its cap.
+     * @see <a href="https://github.com/jenkinsci/ec2-plugin/issues/2030">ec2-plugin issue 2030</a>
      */
     private List<EC2AbstractSlave> provisionFromTemplate(SlaveTemplate t, int number) throws IOException {
         slaveCountingLock.lock();
@@ -1452,7 +1463,12 @@ public class EC2Cloud extends Cloud {
                                 number, t, provisionCount));
             }
 
-            return t.provision(provisionCount, EnumSet.of(SlaveTemplate.ProvisionOptions.ALLOW_CREATE));
+            List<EC2AbstractSlave> slaves =
+                    t.provision(provisionCount, EnumSet.of(SlaveTemplate.ProvisionOptions.ALLOW_CREATE));
+            if (slaves != null && !slaves.isEmpty()) {
+                invalidateInstanceCountCache();
+            }
+            return slaves;
         } finally {
             slaveCountingLock.unlock();
         }
