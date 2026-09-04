@@ -1,0 +1,10 @@
+<div>
+    <p>Spares to hold per build queued for this label. With a factor of 5 and two queued builds,
+    Jenkins aims for ten spares.</p>
+
+    <p>The larger of this number and <i>Base hot spares</i> wins, and <i>Maximum hot spares</i>
+    caps the result. Set this to 0 to hold a fixed number of spares regardless of the queue.</p>
+
+    <p>Agents already booting count towards the target, so a growing queue does not provision the
+    same shortfall repeatedly while the previous batch is still coming up.</p>
+</div>

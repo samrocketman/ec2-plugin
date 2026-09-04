@@ -1,0 +1,11 @@
+<div>
+    <p>Idle termination time for the agents of this label, in minutes, counted from the moment the
+    agent came online rather than from the moment EC2 launched the instance.</p>
+
+    <p>The value means the same as the <i>Idle termination time</i> of an AMI: 0 never stops an idle
+    agent, a positive value is a plain timeout, and a negative value times the agent out within that
+    many minutes of the end of an hourly EC2 billing period.</p>
+
+    <p>This wins over the <i>Idle termination time</i> of the templates the rule matches unless
+    <i>Let a template override the idle termination time</i> is ticked.</p>
+</div>

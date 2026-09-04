@@ -30,4 +30,15 @@ THE SOFTWARE.
       <st:include page="config.jelly" class="${descriptor.clazz}" />
     </f:repeatable>
   </f:entry>
+
+  <f:entry title="${%Hot spares by label}" description="${%Idle agents to keep warm for a label, across every AMI above that carries it}"
+           help="/descriptor/hudson.plugins.ec2.EC2Cloud/help/hotSpareConfigsByLabel">
+    <f:repeatableProperty field="hotSpareConfigsByLabel" add="${%Add hot spare rule}">
+      <f:block>
+        <div align="right">
+          <f:repeatableDeleteButton />
+        </div>
+      </f:block>
+    </f:repeatableProperty>
+  </f:entry>
 </j:jelly>

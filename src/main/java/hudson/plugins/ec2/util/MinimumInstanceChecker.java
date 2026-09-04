@@ -9,20 +9,24 @@ import hudson.model.Queue;
 import hudson.plugins.ec2.EC2AbstractSlave;
 import hudson.plugins.ec2.EC2Cloud;
 import hudson.plugins.ec2.EC2Computer;
+import hudson.plugins.ec2.HotSpareConfigByLabel;
 import hudson.plugins.ec2.SlaveTemplate;
 import java.time.Clock;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import jenkins.model.Jenkins;
 import org.kohsuke.accmod.Restricted;
@@ -96,6 +100,52 @@ public class MinimumInstanceChecker {
     }
 
     /**
+     * Agents of a whole label group. A hot spare rule owns the label rather than one AMI, so its
+     * counts aggregate over every template of the cloud carrying that label instead of matching a
+     * single template description.
+     */
+    private static Stream<EC2Computer> agentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
+        Set<String> descriptions = cloud.getTemplates(label).stream()
+                .map(template -> template.description)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        return Arrays.stream(Jenkins.get().getComputers())
+                .filter(EC2Computer.class::isInstance)
+                .map(EC2Computer.class::cast)
+                .filter(computer -> {
+                    SlaveTemplate computerTemplate = computer.getSlaveTemplate();
+                    return computerTemplate != null && descriptions.contains(computerTemplate.description);
+                });
+    }
+
+    public static int countCurrentNumberOfSpareAgentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
+        return (int) agentsForLabel(cloud, label)
+                .filter(Computer::isIdle)
+                .filter(Computer::isOnline)
+                .count();
+    }
+
+    public static int countCurrentNumberOfProvisioningAgentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
+        return (int) agentsForLabel(cloud, label)
+                .filter(Computer::isIdle)
+                .filter(Computer::isOffline)
+                .filter(Computer::isConnecting)
+                .count();
+    }
+
+    /**
+     * @return the number of buildable queue items any template of the label group could serve.
+     */
+    public static int countQueueItemsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
+        Collection<SlaveTemplate> templates = cloud.getTemplates(label);
+        return (int) Queue.getInstance().getBuildableItems().stream()
+                .map((Queue.Item item) -> item.getAssignedLabel())
+                .filter(Objects::nonNull)
+                .filter(assigned -> templates.stream().anyMatch(template -> assigned.matches(template.getLabelSet())))
+                .count();
+    }
+
+    /**
      * Checks all EC2 cloud templates and provisions agents to meet minimum instance requirements.
      * Synchronized to prevent concurrent provisioning decisions that could lead to over-provisioning
      * when multiple agents accept tasks simultaneously.
@@ -105,16 +155,17 @@ public class MinimumInstanceChecker {
     public static synchronized void checkForMinimumInstances() {
         Jenkins jenkins = Jenkins.get();
 
-        // Early exit if no templates have minimum instance requirements
+        // Early exit if nothing asks for instances to be kept warm
         boolean hasMinimumRequirements = jenkins.clouds.stream()
                 .filter(EC2Cloud.class::isInstance)
                 .map(EC2Cloud.class::cast)
-                .flatMap(cloud -> cloud.getTemplates().stream())
-                .anyMatch(template ->
-                        template.getMinimumNumberOfInstances() > 0 || template.getMinimumNumberOfSpareInstances() > 0);
+                .anyMatch(cloud -> !cloud.getHotSpareConfigsByLabel().isEmpty()
+                        || cloud.getTemplates().stream()
+                                .anyMatch(template -> template.getMinimumNumberOfInstances() > 0
+                                        || template.getMinimumNumberOfSpareInstances() > 0));
 
         if (!hasMinimumRequirements) {
-            // No templates require minimum instances - exit immediately
+            // Neither minimum instances nor label hot spares are configured - exit immediately
             return;
         }
 
@@ -170,6 +221,92 @@ public class MinimumInstanceChecker {
                         cloud.provision(agentTemplate, numberToProvision);
                     }
                 }));
+
+        jenkins.clouds.stream()
+                .filter(EC2Cloud.class::isInstance)
+                .map(EC2Cloud.class::cast)
+                .forEach(MinimumInstanceChecker::checkForLabelHotSpares);
+    }
+
+    /**
+     * Tops up the hot spares for every label rule of a cloud. Runs inside
+     * {@link #checkForMinimumInstances()} rather than from a monitor of its own so all provisioning
+     * decisions stay behind the same lock (JENKINS-76171).
+     *
+     * <p>A rule owns the spare count for its label, so a template's
+     * {@link SlaveTemplate#getMinimumNumberOfSpareInstances()} no longer applies to the templates
+     * the rule covers. Instances already provisioning are subtracted, otherwise every tick would
+     * re-provision the same shortfall while the previous batch is still booting.
+     */
+    private static void checkForLabelHotSpares(@NonNull EC2Cloud cloud) {
+        for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
+            String labelName = config.getLabel();
+            if (labelName == null) {
+                continue;
+            }
+            Label label = Label.get(labelName);
+            Collection<SlaveTemplate> matching = cloud.getTemplates(label);
+            if (matching.isEmpty()) {
+                continue;
+            }
+
+            int currentSpares = countCurrentNumberOfSpareAgentsForLabel(cloud, label);
+            int currentProvisioning = countCurrentNumberOfProvisioningAgentsForLabel(cloud, label);
+            int queuedBuilds = countQueueItemsForLabel(cloud, label);
+
+            int desired = desiredHotSpares(config, queuedBuilds);
+            int toLaunch = desired - (currentSpares + currentProvisioning);
+
+            LOGGER.log(
+                    Level.FINE,
+                    "Hot spares for label {0}: desired={1}, spare={2}, provisioning={3}, queued={4}, toLaunch={5}",
+                    new Object[] {labelName, desired, currentSpares, currentProvisioning, queuedBuilds, toLaunch});
+
+            if (toLaunch > 0) {
+                provisionAcrossLabelGroup(cloud, label, matching, toLaunch);
+            }
+        }
+    }
+
+    /**
+     * How many spares a label should hold. The base count applies even with an empty queue, which
+     * is what makes them <em>hot</em> spares, and the ceiling applies to the label group as a whole.
+     */
+    static int desiredHotSpares(@NonNull HotSpareConfigByLabel config, int queuedBuilds) {
+        int desired = Math.max(config.getBaseHotSpares(), config.getScalingFactor() * queuedBuilds);
+        Integer maxHotSpares = config.getMaxHotSpares();
+        return maxHotSpares == null ? desired : Math.min(desired, maxHotSpares);
+    }
+
+    /**
+     * Spreads a shortfall over the templates of a label group, in rotation order so hot spare
+     * weights apply, and never beyond what a template's instance cap allows. A template at its cap
+     * is skipped for this round and its share is offered to the templates that still have room.
+     */
+    private static void provisionAcrossLabelGroup(
+            @NonNull EC2Cloud cloud, @NonNull Label label, @NonNull Collection<SlaveTemplate> matching, int toLaunch) {
+        for (SlaveTemplate template : cloud.orderTemplatesForLabel(label, matching)) {
+            if (toLaunch <= 0) {
+                return;
+            }
+            int headroom = cloud.getAvailableCapacity(template);
+            if (headroom <= 0) {
+                LOGGER.log(
+                        Level.FINE,
+                        "{0} is at its instance cap, offering its hot spares to the next template",
+                        template);
+                continue;
+            }
+            int number = Math.min(toLaunch, headroom);
+            cloud.provision(template, number);
+            toLaunch -= number;
+        }
+        if (toLaunch > 0) {
+            LOGGER.log(
+                    Level.FINE,
+                    "{0} hot spare(s) for label {1} were not provisioned: every template is at its instance cap",
+                    new Object[] {toLaunch, label.getName()});
+        }
     }
 
     public static boolean minimumInstancesActive(

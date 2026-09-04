@@ -243,9 +243,23 @@ public class EC2Cloud extends Cloud {
 
     private boolean noDelayProvisioning;
 
+    /**
+     * Whether templates matching the same label are rotated instead of being tried in configured
+     * order. Default {@code false} so existing installations keep their template ordering.
+     */
+    private boolean roundRobinTemplatesByLabel;
+
+    /**
+     * Hot spare scaling rules, each owning the spare count for one label across every template
+     * carrying it.
+     */
+    private List<HotSpareConfigByLabel> hotSpareConfigsByLabel = new ArrayList<>();
+
     private boolean cleanUpOrphanedNodes;
 
     private transient volatile Ec2Client connection;
+
+    private transient LabelTemplateRotation rotation;
 
     @DataBoundConstructor
     public EC2Cloud(
@@ -423,6 +437,145 @@ public class EC2Cloud extends Cloud {
         this.noDelayProvisioning = noDelayProvisioning;
     }
 
+    /**
+     * @return whether templates matching the same label are treated as interchangeable hardware and
+     *     rotated, honouring {@link SlaveTemplate#getHotSpareWeight()}. When disabled, templates are
+     *     tried in configured order.
+     */
+    public boolean isRoundRobinTemplatesByLabel() {
+        return roundRobinTemplatesByLabel;
+    }
+
+    @DataBoundSetter
+    public void setRoundRobinTemplatesByLabel(boolean roundRobinTemplatesByLabel) {
+        this.roundRobinTemplatesByLabel = roundRobinTemplatesByLabel;
+    }
+
+    @NonNull
+    public List<HotSpareConfigByLabel> getHotSpareConfigsByLabel() {
+        return hotSpareConfigsByLabel == null ? Collections.emptyList() : hotSpareConfigsByLabel;
+    }
+
+    @DataBoundSetter
+    public void setHotSpareConfigsByLabel(List<HotSpareConfigByLabel> hotSpareConfigsByLabel) {
+        this.hotSpareConfigsByLabel = hotSpareConfigsByLabel == null ? new ArrayList<>() : hotSpareConfigsByLabel;
+    }
+
+    /**
+     * @return the hot spare rule that applies to this computer, or {@code null} if none does. A
+     *     computer matches a rule when the rule's label is carried by the computer's template, the
+     *     same homogeneity test {@link #getTemplates(Label)} uses.
+     */
+    @CheckForNull
+    public HotSpareConfigByLabel getHotSpareConfigFor(@NonNull EC2Computer computer) {
+        return getHotSpareConfigFor(computer.getSlaveTemplate());
+    }
+
+    @CheckForNull
+    HotSpareConfigByLabel getHotSpareConfigFor(@CheckForNull SlaveTemplate template) {
+        if (template == null) {
+            return null;
+        }
+        for (HotSpareConfigByLabel config : getHotSpareConfigsByLabel()) {
+            if (config.matches(template)) {
+                return config;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @return the idle timeout configured for a label, or {@code null} if no rule covers it.
+     */
+    @CheckForNull
+    public Integer getIdleTerminationForLabel(@NonNull String label) {
+        for (HotSpareConfigByLabel config : getHotSpareConfigsByLabel()) {
+            if (label.equals(config.getLabel())) {
+                return config.getIdleTimeoutMinutes();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Idle termination for a computer as governed by a matching hot spare rule.
+     *
+     * <p>The rule wins by default. A template only takes precedence when the rule opts in to it
+     * <em>and</em> the template sets an idle termination time of its own: without that second
+     * condition every default template would beat the rule with its own unset value.
+     *
+     * @return the effective idle termination in minutes, or {@code null} to keep the value the
+     *     retention strategy was configured with.
+     */
+    @CheckForNull
+    public Integer resolveIdleTerminationMinutes(@NonNull EC2Computer computer) {
+        HotSpareConfigByLabel config = getHotSpareConfigFor(computer);
+        if (config == null) {
+            return null;
+        }
+        SlaveTemplate template = computer.getSlaveTemplate();
+        if (config.isAllowTemplateIdleTimeoutOverride() && hasExplicitIdleTermination(template)) {
+            return null;
+        }
+        return config.getIdleTimeoutMinutes();
+    }
+
+    /**
+     * Grace period for a computer, resolved the same way as the idle termination time.
+     *
+     * @return the effective grace period in minutes; 0 means no grace period.
+     */
+    public int resolveGracePeriodMinutes(@NonNull EC2Computer computer) {
+        SlaveTemplate template = computer.getSlaveTemplate();
+        int templateGrace = template == null ? 0 : template.getGracePeriodMinutes();
+        HotSpareConfigByLabel config = getHotSpareConfigFor(computer);
+        if (config == null) {
+            return templateGrace;
+        }
+        if (config.isAllowTemplateGracePeriodOverride() && templateGrace != 0) {
+            return templateGrace;
+        }
+        return config.getGracePeriodMinutes();
+    }
+
+    /**
+     * Whether grace-period expiry discards the agent rather than starting its idle clock. A plain
+     * boolean cannot express "unset", so this flag travels with whichever grace period won rather
+     * than having a precedence rule of its own.
+     */
+    public boolean resolveDiscardAfterGracePeriod(@NonNull EC2Computer computer) {
+        SlaveTemplate template = computer.getSlaveTemplate();
+        boolean templateDiscard = template == null || template.isDiscardAfterGracePeriod();
+        int templateGrace = template == null ? 0 : template.getGracePeriodMinutes();
+        HotSpareConfigByLabel config = getHotSpareConfigFor(computer);
+        if (config == null) {
+            return templateDiscard;
+        }
+        if (config.isAllowTemplateGracePeriodOverride() && templateGrace != 0) {
+            return templateDiscard;
+        }
+        return config.isDiscardAfterGracePeriod();
+    }
+
+    /**
+     * @return whether the template sets an idle termination time of its own. The field is a string,
+     *     so blank means unset, which is the tri-state the override checkbox needs.
+     */
+    private static boolean hasExplicitIdleTermination(@CheckForNull SlaveTemplate template) {
+        return template != null && Util.fixEmptyAndTrim(template.getidleTerminationMinutes()) != null;
+    }
+
+    /**
+     * @return the rotation state for this cloud's labels. Transient, so it is recreated after a
+     *     restart or a configuration reload.
+     */
+    synchronized LabelTemplateRotation getRotation() {
+        if (rotation == null) {
+            rotation = new LabelTemplateRotation(this::isRoundRobinTemplatesByLabel);
+        }
+        return rotation;
+    }
+
     public boolean isCleanUpOrphanedNodes() {
         return cleanUpOrphanedNodes;
     }
@@ -506,6 +659,10 @@ public class EC2Cloud extends Cloud {
         this.slaveCountingLock = new ReentrantLock();
         if (this.cachedTemplateSlaves == null) {
             this.cachedTemplateSlaves = new ConcurrentHashMap<>();
+        }
+        this.rotation = new LabelTemplateRotation(this::isRoundRobinTemplatesByLabel);
+        if (this.hotSpareConfigsByLabel == null) {
+            this.hotSpareConfigsByLabel = new ArrayList<>();
         }
 
         for (SlaveTemplate t : templates) {
@@ -1049,6 +1206,22 @@ public class EC2Cloud extends Cloud {
     }
 
     /**
+     * @return how many more instances a template may launch before it, or the cloud, reaches its
+     *     instance cap. Never negative, and 0 means the template must be skipped.
+     */
+    public int getAvailableCapacity(@NonNull SlaveTemplate template) {
+        slaveCountingLock.lock();
+        try {
+            return Math.max(0, getPossibleNewSlavesCount(template));
+        } catch (SdkException e) {
+            LOGGER.log(Level.WARNING, template + ". Exception checking capacity", e);
+            return 0;
+        } finally {
+            slaveCountingLock.unlock();
+        }
+    }
+
+    /**
      * Obtains a agent whose AMI matches the AMI of the given template, and that also has requiredLabel (if requiredLabel is non-null)
      * forceCreateNew specifies that the creation of a new agent is required. Otherwise, an existing matching agent may be re-used
      */
@@ -1099,7 +1272,16 @@ public class EC2Cloud extends Cloud {
             return Collections.emptyList();
         }
 
-        for (final SlaveTemplate t : matchingTemplates) {
+        /*
+         * Templates matching a label are candidates for the same work. With rotation enabled they
+         * are rotated so the label spreads across the interchangeable instance types the admin
+         * configured; otherwise they keep their configured order. Everything below operates on the
+         * resolved order, so the fallback to the next template behaves the same either way.
+         */
+        final List<SlaveTemplate> ordered = orderTemplatesForLabel(label, matchingTemplates);
+
+        for (int candidateIndex = 0; candidateIndex < ordered.size(); candidateIndex++) {
+            final SlaveTemplate t = ordered.get(candidateIndex);
             LOGGER.log(
                     Level.INFO,
                     "{0}. Attempting to provision agent needed by excess workload of " + excessWorkload + " units",
@@ -1124,55 +1306,11 @@ public class EC2Cloud extends Cloud {
             }
 
             final int number = actualNumber;
+            final int startIndex = candidateIndex;
 
             // Defer runInstances to background; return PlannedNodes immediately for fast NodeProvisioner response
             CompletableFuture<List<EC2AbstractSlave>> provisionFuture = CompletableFuture.supplyAsync(
-                    () -> {
-                        try {
-                            slaveCountingLock.lock();
-                            try {
-                                int possibleSlavesCount = getPossibleNewSlavesCount(t);
-                                if (possibleSlavesCount <= 0) {
-                                    LOGGER.log(Level.INFO, "{0}. Cannot provision - no capacity", t);
-                                    return null;
-                                }
-
-                                EnumSet<SlaveTemplate.ProvisionOptions> provisionOptions =
-                                        EnumSet.of(SlaveTemplate.ProvisionOptions.ALLOW_CREATE);
-                                int provisionCount = Math.min(number, possibleSlavesCount);
-
-                                if (provisionCount != number) {
-                                    LOGGER.log(
-                                            Level.INFO,
-                                            String.format(
-                                                    "%d nodes were requested for the template %s, "
-                                                            + "but because of instance cap only %d can be provisioned",
-                                                    number, t, provisionCount));
-                                }
-
-                                return t.provision(provisionCount, provisionOptions);
-                            } finally {
-                                slaveCountingLock.unlock();
-                            }
-                        } catch (AwsServiceException e) {
-                            LOGGER.log(Level.WARNING, t + ". Exception during provisioning", e);
-                            if ("RequestExpired".equals(e.awsErrorDetails().errorCode())
-                                    || "ExpiredToken".equals(e.awsErrorDetails().errorCode())) {
-                                LOGGER.log(
-                                        Level.INFO, "Reconnecting to EC2 due to RequestExpired or ExpiredToken error");
-                                try {
-                                    reconnectToEc2();
-                                } catch (IOException e2) {
-                                    LOGGER.log(Level.WARNING, "Failed to reconnect ec2", e2);
-                                }
-                            }
-                            return null;
-                        } catch (SdkException | IOException e) {
-                            LOGGER.log(Level.WARNING, t + ". Exception during provisioning", e);
-                            return null;
-                        }
-                    },
-                    PROVISIONING_EXECUTOR);
+                    () -> provisionFromGroup(ordered, startIndex, number), PROVISIONING_EXECUTOR);
 
             provisionFuture.whenComplete((slaves, ex) -> {
                 if (slaves != null && !slaves.isEmpty()) {
@@ -1189,7 +1327,10 @@ public class EC2Cloud extends Cloud {
                                 PROVISIONING_EXECUTOR)
                         .thenComposeAsync(
                                 slave -> slave != null
-                                        ? waitForRunningAndConnectAsync(t, slave)
+                                        // The group is homogeneous, but the agent may have come from
+                                        // a later template than the one planned, so log against its
+                                        // own template.
+                                        ? waitForRunningAndConnectAsync(templateOf(slave, t), slave)
                                         : CompletableFuture.completedFuture(null),
                                 Computer.threadPoolForRemoting);
 
@@ -1207,6 +1348,114 @@ public class EC2Cloud extends Cloud {
             });
         }
         return plannedNodes;
+    }
+
+    /**
+     * @return the template an agent was actually provisioned from, or {@code fallback} when it can
+     *     no longer be resolved.
+     */
+    private SlaveTemplate templateOf(EC2AbstractSlave slave, SlaveTemplate fallback) {
+        SlaveTemplate actual = getTemplate(slave.templateDescription);
+        return actual == null ? fallback : actual;
+    }
+
+    /**
+     * Resolves the order in which the templates matching a label are tried.
+     *
+     * @return the rotation order when {@link #isRoundRobinTemplatesByLabel()} is enabled, and the
+     *     configured order otherwise.
+     */
+    @Restricted(NoExternalUse.class)
+    public List<SlaveTemplate> orderTemplatesForLabel(Label label, Collection<SlaveTemplate> matching) {
+        if (!roundRobinTemplatesByLabel) {
+            return new ArrayList<>(matching);
+        }
+        return getRotation().order(label == null ? "" : label.getName(), matching);
+    }
+
+    /**
+     * Provisions {@code number} instances from the label group, starting at {@code startIndex} and
+     * falling back to the next template when one cannot deliver.
+     *
+     * <p>Failing over here rather than returning {@code null} is what makes a label provision as
+     * fast as its fastest available instance type: an insufficient-capacity error used to cost a
+     * whole {@link hudson.slaves.NodeProvisioner} cycle before another template was tried. Only a
+     * capacity error puts a template into the rotation cooldown; being at its instance cap or
+     * failing for any other reason just moves on to the next candidate for this request.
+     *
+     * @return the provisioned agents, or {@code null} if no template in the group could provide any.
+     */
+    private List<EC2AbstractSlave> provisionFromGroup(List<SlaveTemplate> ordered, int startIndex, int number) {
+        for (int i = startIndex; i < ordered.size(); i++) {
+            final SlaveTemplate t = ordered.get(i);
+            try {
+                List<EC2AbstractSlave> slaves = provisionFromTemplate(t, number);
+                if (slaves != null && !slaves.isEmpty()) {
+                    return slaves;
+                }
+                LOGGER.log(Level.INFO, "{0}. Provisioning returned no instances, trying next template", t);
+            } catch (AwsServiceException e) {
+                String errorCode =
+                        e.awsErrorDetails() == null ? null : e.awsErrorDetails().errorCode();
+                if (SlaveTemplate.isInsufficientCapacityError(errorCode)) {
+                    getRotation().markTemplateUnavailable(t, ordered.size());
+                    LOGGER.log(
+                            Level.INFO,
+                            String.format(
+                                    "Template %s has insufficient capacity for instance type %s (%s); trying next template",
+                                    t.getDescription(), t.getType(), errorCode));
+                } else {
+                    LOGGER.log(Level.WARNING, t + ". Exception during provisioning, trying next template", e);
+                    if ("RequestExpired".equals(errorCode) || "ExpiredToken".equals(errorCode)) {
+                        LOGGER.log(Level.INFO, "Reconnecting to EC2 due to RequestExpired or ExpiredToken error");
+                        try {
+                            reconnectToEc2();
+                        } catch (IOException e2) {
+                            LOGGER.log(Level.WARNING, "Failed to reconnect ec2", e2);
+                        }
+                    }
+                }
+            } catch (SdkException | IOException e) {
+                LOGGER.log(Level.WARNING, t + ". Exception during provisioning, trying next template", e);
+            }
+            /*
+             * The next candidate must see current instance counts rather than the ones cached
+             * before this attempt, otherwise the cloud-wide cap could be overshot while walking
+             * down the group.
+             */
+            invalidateInstanceCountCache();
+        }
+        return null;
+    }
+
+    /**
+     * Provisions up to {@code number} instances from a single template, respecting its instance cap.
+     *
+     * @return the provisioned agents, or {@code null} if the template is at its cap.
+     */
+    private List<EC2AbstractSlave> provisionFromTemplate(SlaveTemplate t, int number) throws IOException {
+        slaveCountingLock.lock();
+        try {
+            int possibleSlavesCount = getPossibleNewSlavesCount(t);
+            if (possibleSlavesCount <= 0) {
+                LOGGER.log(Level.INFO, "{0}. Cannot provision - no capacity", t);
+                return null;
+            }
+
+            int provisionCount = Math.min(number, possibleSlavesCount);
+            if (provisionCount != number) {
+                LOGGER.log(
+                        Level.INFO,
+                        String.format(
+                                "%d nodes were requested for the template %s, "
+                                        + "but because of instance cap only %d can be provisioned",
+                                number, t, provisionCount));
+            }
+
+            return t.provision(provisionCount, EnumSet.of(SlaveTemplate.ProvisionOptions.ALLOW_CREATE));
+        } finally {
+            slaveCountingLock.unlock();
+        }
     }
 
     /**
