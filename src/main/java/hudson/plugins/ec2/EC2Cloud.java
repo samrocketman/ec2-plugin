@@ -176,6 +176,17 @@ public class EC2Cloud extends Cloud {
     private volatile int cachedTotalSlaves = -1;
     private transient ConcurrentHashMap<String, Integer> cachedTemplateSlaves = new ConcurrentHashMap<>();
 
+    /**
+     * How long a launched instance keeps counting against the caps while EC2 has not reported it.
+     * Long enough for describe-instances and describe-spot-instance-requests to catch up, short
+     * enough that an instance which never appears stops blocking provisioning.
+     */
+    private static final long IN_FLIGHT_INSTANCE_TTL_MS =
+            Long.getLong("jenkins.ec2.inFlightInstanceTtlMs", TimeUnit.MINUTES.toMillis(2));
+
+    private transient ConcurrentHashMap<String, InFlightInstance> inFlightInstances = new ConcurrentHashMap<>();
+    private transient volatile Set<String> lastCountedInstanceIds = Collections.emptySet();
+
     private static final ExecutorService PROVISIONING_EXECUTOR = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "EC2Cloud-provisioning");
         t.setDaemon(true);
@@ -660,6 +671,12 @@ public class EC2Cloud extends Cloud {
         if (this.cachedTemplateSlaves == null) {
             this.cachedTemplateSlaves = new ConcurrentHashMap<>();
         }
+        if (this.inFlightInstances == null) {
+            this.inFlightInstances = new ConcurrentHashMap<>();
+        }
+        if (this.lastCountedInstanceIds == null) {
+            this.lastCountedInstanceIds = Collections.emptySet();
+        }
         this.rotation = new LabelTemplateRotation(this::isRoundRobinTemplatesByLabel);
         if (this.hotSpareConfigsByLabel == null) {
             this.hotSpareConfigsByLabel = new ArrayList<>();
@@ -962,6 +979,8 @@ public class EC2Cloud extends Cloud {
 
         n += countCurrentEC2SpotSlaves(template, jenkinsServerUrl, instanceIds);
 
+        observeCountedInstances(instanceIds, template == null);
+
         return n;
     }
 
@@ -1167,17 +1186,24 @@ public class EC2Cloud extends Cloud {
     /**
      * Returns the maximum number of possible agents that can be created.
      * Uses cached instance counts when fresh (within TTL) to avoid repeated EC2 API calls.
+     *
+     * <p>Instances this cloud has launched but EC2 has not reported yet are counted on top of
+     * whatever EC2 says, so a request that arrives before the launch is visible still sees the caps
+     * as full. Without that, two requests a moment apart both pass the same cap: the second reads
+     * either the cached count or an EC2 answer that does not include the first launch yet.
+     *
+     * @see <a href="https://github.com/jenkinsci/ec2-plugin/issues/2030">ec2-plugin issue 2030</a>
      */
     private int getPossibleNewSlavesCount(SlaveTemplate template) throws SdkException {
         long now = System.currentTimeMillis();
-        String templateKey = Objects.toString(template.description, "") + ":" + template.getAmi();
+        String templateKey = templateCountKey(template);
 
         if (now - instanceCountCacheTimestamp < INSTANCE_COUNT_CACHE_TTL_MS) {
             int total = cachedTotalSlaves;
             Integer templateCount = cachedTemplateSlaves.get(templateKey);
             if (total >= 0 && templateCount != null && templateCount >= 0) {
-                int availableTotalSlaves = instanceCap - total;
-                int availableAmiSlaves = template.getInstanceCap() - templateCount;
+                int availableTotalSlaves = instanceCap - total - countInFlight(null);
+                int availableAmiSlaves = template.getInstanceCap() - templateCount - countInFlight(templateKey);
                 return Math.min(availableAmiSlaves, availableTotalSlaves);
             }
         }
@@ -1189,14 +1215,82 @@ public class EC2Cloud extends Cloud {
         cachedTotalSlaves = estimatedTotalSlaves;
         cachedTemplateSlaves.put(templateKey, estimatedAmiSlaves);
 
-        int availableTotalSlaves = instanceCap - estimatedTotalSlaves;
-        int availableAmiSlaves = template.getInstanceCap() - estimatedAmiSlaves;
+        int availableTotalSlaves = instanceCap - estimatedTotalSlaves - countInFlight(null);
+        int availableAmiSlaves = template.getInstanceCap() - estimatedAmiSlaves - countInFlight(templateKey);
         LOGGER.log(
                 Level.FINE,
                 "Available Total Agents: " + availableTotalSlaves + " Available AMI agents: " + availableAmiSlaves
                         + " AMI: " + template.getAmi() + " TemplateDesc: " + template.description);
 
         return Math.min(availableAmiSlaves, availableTotalSlaves);
+    }
+
+    private static String templateCountKey(SlaveTemplate template) {
+        return Objects.toString(template.description, "") + ":" + template.getAmi();
+    }
+
+    /**
+     * Records instances that have just been launched so they count against the caps until EC2
+     * reports them. Called while the counting lock is held, so the next request to reach the cap
+     * check already sees them.
+     *
+     * <p>An instance the last count already reported is not recorded: reusing an orphaned or
+     * stopped instance is not a new launch, and counting it twice would understate the headroom.
+     */
+    private void recordInFlight(SlaveTemplate template, @CheckForNull List<EC2AbstractSlave> slaves) {
+        if (slaves == null || slaves.isEmpty()) {
+            return;
+        }
+        String templateKey = templateCountKey(template);
+        long now = System.currentTimeMillis();
+        for (EC2AbstractSlave slave : slaves) {
+            String instanceId = slave.getInstanceId();
+            if (instanceId != null && !instanceId.isBlank() && !lastCountedInstanceIds.contains(instanceId)) {
+                inFlightInstances.put(instanceId, new InFlightInstance(templateKey, now));
+            }
+        }
+    }
+
+    /**
+     * Drops the in-flight records EC2 has caught up with, so they are not counted twice.
+     *
+     * @param countedInstanceIds the instances the count just returned.
+     * @param wasCloudWideCount whether the count covered every template, which is the only case
+     *     where the absence of an instance means EC2 really has not reported it yet.
+     */
+    private void observeCountedInstances(Set<String> countedInstanceIds, boolean wasCloudWideCount) {
+        if (wasCloudWideCount) {
+            lastCountedInstanceIds = Set.copyOf(countedInstanceIds);
+        }
+        inFlightInstances.keySet().removeAll(countedInstanceIds);
+    }
+
+    /**
+     * @param templateKey the template to count for, or {@code null} for every template.
+     * @return how many launched instances EC2 has not reported yet. Records older than
+     *     {@link #IN_FLIGHT_INSTANCE_TTL_MS} are discarded: by then the instance is either counted
+     *     by EC2 or gone, and holding on to it would understate the headroom forever.
+     */
+    private int countInFlight(@CheckForNull String templateKey) {
+        long cutoff = System.currentTimeMillis() - IN_FLIGHT_INSTANCE_TTL_MS;
+        inFlightInstances.values().removeIf(inFlight -> inFlight.launchedAtMillis < cutoff);
+        if (templateKey == null) {
+            return inFlightInstances.size();
+        }
+        return (int) inFlightInstances.values().stream()
+                .filter(inFlight -> templateKey.equals(inFlight.templateKey))
+                .count();
+    }
+
+    private static final class InFlightInstance {
+
+        private final String templateKey;
+        private final long launchedAtMillis;
+
+        InFlightInstance(String templateKey, long launchedAtMillis) {
+            this.templateKey = templateKey;
+            this.launchedAtMillis = launchedAtMillis;
+        }
     }
 
     private void invalidateInstanceCountCache() {
@@ -1253,10 +1347,7 @@ public class EC2Cloud extends Cloud {
             }
 
             List<EC2AbstractSlave> slaves = t.provision(number, provisionOptions);
-            if (slaves != null && !slaves.isEmpty()) {
-                // As in provisionFromTemplate: commit the count before the next caller can read it.
-                invalidateInstanceCountCache();
-            }
+            recordInFlight(t, slaves);
             return slaves;
         } finally {
             slaveCountingLock.unlock();
@@ -1436,10 +1527,9 @@ public class EC2Cloud extends Cloud {
     /**
      * Provisions up to {@code number} instances from a single template, respecting its instance cap.
      *
-     * <p>The cached instance counts are dropped while the counting lock is still held once a launch
-     * has been committed, so a request that arrives moments later re-reads the count from EC2
-     * instead of the one cached before either request launched anything. Two concurrent requests
-     * would otherwise both pass the same cap.
+     * <p>A launch is recorded as in flight while the counting lock is still held, so a request that
+     * arrives moments later counts it against the cap even though neither the cached count nor EC2
+     * itself reports it yet. Two concurrent requests would otherwise both pass the same cap.
      *
      * @return the provisioned agents, or {@code null} if the template is at its cap.
      * @see <a href="https://github.com/jenkinsci/ec2-plugin/issues/2030">ec2-plugin issue 2030</a>
@@ -1465,9 +1555,7 @@ public class EC2Cloud extends Cloud {
 
             List<EC2AbstractSlave> slaves =
                     t.provision(provisionCount, EnumSet.of(SlaveTemplate.ProvisionOptions.ALLOW_CREATE));
-            if (slaves != null && !slaves.isEmpty()) {
-                invalidateInstanceCountCache();
-            }
+            recordInFlight(t, slaves);
             return slaves;
         } finally {
             slaveCountingLock.unlock();

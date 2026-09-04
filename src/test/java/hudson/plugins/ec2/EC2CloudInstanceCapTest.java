@@ -11,6 +11,7 @@ import hudson.plugins.ec2.util.AmazonEC2FactoryMockImpl;
 import hudson.plugins.ec2.util.MinimumInstanceChecker;
 import hudson.plugins.ec2.util.SSHCredentialHelper;
 import java.security.Security;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -125,9 +126,9 @@ class EC2CloudInstanceCapTest {
     }
 
     /**
-     * Headroom is re-read after a label request rather than served from the 30 second instance
-     * count cache, which is what keeps a template from being filled past its cap by the requests
-     * that follow within that window.
+     * A launch counts against the headroom as soon as it happens, even though the instance count
+     * cache still holds the count from before it and EC2 may not report it yet. That is what keeps
+     * requests arriving inside the cache window from filling a template past its cap.
      */
     @Test
     void testHeadroomReflectsALabelRequestWithoutWaitingForTheCacheToExpire() throws Exception {
@@ -138,12 +139,43 @@ class EC2CloudInstanceCapTest {
         cloud.provision(Label.get(LABEL), 1);
         awaitInstanceCount(1);
 
-        // Well inside the cache TTL, so a stale count would still report the original headroom.
+        // Well inside the cache TTL, so a stale count on its own would still report two.
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
         while (cloud.getAvailableCapacity(cloud.getTemplates().get(0)) == 2 && System.currentTimeMillis() < deadline) {
             Thread.sleep(100);
         }
         assertThat(cloud.getAvailableCapacity(cloud.getTemplates().get(0)), equalTo(1));
+    }
+
+    /**
+     * Picking up an orphaned instance is not a new launch. Once EC2 reports that instance, counting
+     * it again as in flight would charge one instance twice and starve the cloud of headroom it
+     * still has.
+     */
+    @Test
+    void testReusedInstanceIsNotCountedTwice() throws Exception {
+        SlaveTemplate reusing = template("reusing", FIRST_TYPE, 5, 1);
+        reusing.setAvoidUsingOrphanedNodes(false);
+        SlaveTemplate other = template("other", SECOND_TYPE, 5, 1);
+        EC2Cloud cloud = cloud("2", false, null, reusing, other);
+
+        cloud.provision(cloud.getTemplates().get(0), 1);
+        assertThat(instanceCount(), equalTo(1));
+
+        // Orphan it: the instance keeps running, but Jenkins no longer has a node for it.
+        for (Node node : new ArrayList<>(r.jenkins.getNodes())) {
+            r.jenkins.removeNode(node);
+        }
+        // Counting the second template is a cache miss, so this reads the instance back from EC2.
+        assertThat(cloud.getAvailableCapacity(cloud.getTemplates().get(1)), equalTo(1));
+
+        cloud.provision(cloud.getTemplates().get(0), 1);
+
+        assertThat("the orphan should have been adopted rather than replaced", instanceCount(), equalTo(1));
+        assertThat(
+                "one running instance against a cloud cap of two leaves one",
+                cloud.getAvailableCapacity(cloud.getTemplates().get(0)),
+                equalTo(1));
     }
 
     /**
@@ -187,6 +219,10 @@ class EC2CloudInstanceCapTest {
                 .map(EC2Computer::getNode)
                 .filter(node -> node != null)
                 .collect(Collectors.groupingBy(node -> node.templateDescription, Collectors.counting()));
+    }
+
+    private static int instanceCount() {
+        return AmazonEC2FactoryMockImpl.instances.size();
     }
 
     private static Map<String, Long> instanceTypeCounts() {
