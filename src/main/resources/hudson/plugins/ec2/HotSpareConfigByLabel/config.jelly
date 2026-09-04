@@ -8,7 +8,7 @@
     <f:textbox default="0" />
   </f:entry>
 
-  <f:entry title="${%Hot spares per queued build}" field="scalingFactor">
+  <f:entry title="${%Hot spare step}" field="scalingFactor">
     <f:textbox default="5" />
   </f:entry>
 

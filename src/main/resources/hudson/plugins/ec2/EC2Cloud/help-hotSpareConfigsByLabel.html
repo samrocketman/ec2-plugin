@@ -2,11 +2,18 @@
     <p>Keeps a number of idle agents warm per Jenkins label instead of per AMI, so a label that is
     served by several AMIs is treated as one pool of interchangeable hardware.</p>
 
-    <p>Each rule names a label, a base number of spares to hold when nothing is queued, and how many
-    spares to add per queued build, with an optional ceiling. The counts cover every AMI above that
-    carries the label, and the spares are spread over those AMIs in the same order provisioning uses
-    &mdash; so with <i>Round-robin templates matching the same label</i> enabled, their <i>Hot spare
-    weight</i> applies here too.</p>
+    <p>Each rule names a label, a base number of spares to hold at all times, and the step by which
+    the number of spares grows and shrinks, with an optional ceiling. The counts cover every AMI
+    that carries the label, and the spares are spread over those AMIs in the same order provisioning
+    uses &mdash; so with <i>Round-robin templates matching the same label</i> enabled, their <i>Hot
+    spare weight</i> applies here too.</p>
+
+    <p>The number of spares is a prediction rather than a fixed setting. A spare taken by a build is
+    replaced, so a busy label stays warm for the whole of a busy period. If builds keep waiting, the
+    target grows by the step until the label keeps up; when spares go unused, or nothing asks for the
+    label at all, it shrinks by the same step until it reaches the base count. A label with a base
+    count of zero therefore scales to nothing when Jenkins is idle and warms itself back up as work
+    arrives.</p>
 
     <p>A rule takes over the spare count of the AMIs it matches: their <i>Minimum number of spare
     instances</i> is ignored while it does. <i>Minimum number of instances</i> is unaffected and

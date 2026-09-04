@@ -331,6 +331,7 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                     if (slaveNode != null) {
                         try {
                             Queue.withLock(slaveNode::idleTimeout);
+                            noteReclaimedSpare(computer);
                         } catch (Exception e) {
                             LOGGER.log(Level.FINE, "Error idle timeout for " + computer.getName(), e);
                         }
@@ -364,6 +365,7 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                     if (slaveNode != null) {
                         try {
                             Queue.withLock(slaveNode::idleTimeout);
+                            noteReclaimedSpare(computer);
                         } catch (Exception e) {
                             LOGGER.log(Level.FINE, "Error idle timeout for " + computer.getName(), e);
                         }
@@ -372,6 +374,24 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
             }
         }
         return CHECK_INTERVAL_MINUTES;
+    }
+
+    /**
+     * Tells the hot spare prediction for every label covering this agent that a spare went unused
+     * for a whole idle timeout, so the target comes down instead of replacing what was just given
+     * up.
+     */
+    private static void noteReclaimedSpare(EC2Computer computer) {
+        EC2Cloud cloud = cloudOf(computer);
+        SlaveTemplate template = computer.getSlaveTemplate();
+        if (cloud == null || template == null) {
+            return;
+        }
+        for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
+            if (config.matches(template)) {
+                HotSpareDemand.spareReclaimed(cloud, config);
+            }
+        }
     }
 
     /**

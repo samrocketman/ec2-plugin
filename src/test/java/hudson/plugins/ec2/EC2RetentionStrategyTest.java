@@ -915,6 +915,42 @@ class EC2RetentionStrategyTest {
     }
 
     /**
+     * A spare that went unused for a whole idle timeout means the hot spare prediction for its
+     * label overshot, so reclaiming it lowers the target. Without this the label would immediately
+     * provision a replacement for the agent it just gave up.
+     */
+    @Test
+    void testReclaimingAnIdleSpareLowersTheHotSpareTargetForItsLabel() throws Exception {
+        final int RETENTION_MINUTES = 5;
+        HotSpareConfigByLabel rule = new HotSpareConfigByLabel("ttt");
+        rule.setScalingFactor(5);
+        rule.setIdleTimeoutMinutes(RETENTION_MINUTES);
+        // The mock agents report cloudName "cloud", which is how the strategy finds the rule.
+        EC2Cloud cloud =
+                new EC2Cloud("cloud", true, "abc", "us-east-1", null, "ghi", "20", Collections.emptyList(), null, null);
+        cloud.setHotSpareConfigsByLabel(List.of(rule));
+        r.jenkins.clouds.add(cloud);
+        HotSpareDemand.reset();
+        assertThat(HotSpareDemand.of(cloud, "ttt").updateTarget(rule, 0, 0, 5, 0), equalTo(5));
+
+        final int BOOT_MINUTES = 5;
+        final Instant readyAt = Instant.now().plus(Duration.ofMinutes(BOOT_MINUTES));
+        final Instant checkTime = Instant.now().plus(Duration.ofMinutes(BOOT_MINUTES + RETENTION_MINUTES + 1));
+
+        new EC2RetentionStrategy(
+                        String.format("%d", RETENTION_MINUTES),
+                        Clock.fixed(checkTime.plusSeconds(1), zoneId),
+                        checkTime.toEpochMilli())
+                .check(computerWithUpTime(20, 0, false, false, readyAt.toEpochMilli()));
+
+        assertThat("the idle spare should have been reclaimed", idleTimeoutCalled.get(), equalTo(true));
+        assertThat(
+                "the target should have given back a step",
+                HotSpareDemand.of(cloud, "ttt").getTarget(),
+                equalTo(0));
+    }
+
+    /**
      * An agent that has not connected yet is left alone until its grace period expires.
      */
     @Test

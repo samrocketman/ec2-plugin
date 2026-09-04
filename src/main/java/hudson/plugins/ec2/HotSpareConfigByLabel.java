@@ -61,6 +61,9 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
 
     private static final long serialVersionUID = 1L;
 
+    /** Also the window a quiet label takes to give up one step of its spare target. */
+    public static final int DEFAULT_IDLE_TIMEOUT_MINUTES = 15;
+
     private final String label;
 
     private int scalingFactor = 5;
@@ -69,7 +72,7 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
 
     private Integer maxHotSpares;
 
-    private int idleTimeoutMinutes = 15;
+    private int idleTimeoutMinutes = DEFAULT_IDLE_TIMEOUT_MINUTES;
 
     private int gracePeriodMinutes = 0;
 
@@ -89,7 +92,9 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
     }
 
     /**
-     * @return how many spares to hold per queued build for this label.
+     * @return the amount the spare target moves by when the label cannot keep up with the work
+     *     arriving, and the amount it gives back when the spares go unused.
+     * @see HotSpareDemand
      */
     public int getScalingFactor() {
         return scalingFactor;
@@ -101,7 +106,8 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
     }
 
     /**
-     * @return the number of spares to keep warm for this label even when nothing is queued.
+     * @return the number of spares to keep warm for this label at all times, which is also the
+     *     floor the target decays to once the label goes quiet.
      */
     public int getBaseHotSpares() {
         return baseHotSpares;
@@ -281,7 +287,7 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
 
         @POST
         public FormValidation doCheckScalingFactor(@QueryParameter String value) {
-            return nonNegative(value, "Scaling factor");
+            return nonNegative(value, "Hot spare step");
         }
 
         @POST

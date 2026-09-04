@@ -1,9 +1,10 @@
 <div>
-    <p>Ceiling on the spares held for this label. It applies to the label group as a whole, so a
-    maximum of 3 means three spares spread over every AMI carrying the label, not three per AMI.</p>
+    <p>Ceiling on the spares held for this label, and therefore on how far the spare target can
+    climb while the label cannot keep up. It applies to the label group as a whole, so a maximum of
+    3 means three spares spread over every AMI carrying the label, not three per AMI.</p>
 
-    <p>Leave blank for no ceiling, in which case <i>Hot spares per queued build</i> is only limited
-    by the instance caps.</p>
+    <p>Leave blank for no ceiling, in which case a sustained burst grows the target until it is
+    limited only by the instance caps. Set it if the cost of that is a concern.</p>
 
     <p>This can only lower the number of spares, never raise it: each AMI's <i>Instance Cap</i> and
     the cloud-wide cap still apply, so a template already at its cap is skipped even when this

@@ -8,4 +8,10 @@
 
     <p>This wins over the <i>Idle termination time</i> of the templates the rule matches unless
     <i>Let a template override the idle termination time</i> is ticked.</p>
+
+    <p>It is also the rate at which the spare target fades: a label with nothing to do gives up one
+    <i>Hot spare step</i> per idle termination time, so the prediction stops asking for agents at
+    the same pace the agents behind it are being reclaimed. When idle termination is off, the
+    default of 15 minutes is used for the fade, otherwise a target raised once would never come
+    back down.</p>
 </div>

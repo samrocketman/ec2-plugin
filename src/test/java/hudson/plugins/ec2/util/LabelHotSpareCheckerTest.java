@@ -3,22 +3,32 @@ package hudson.plugins.ec2.util;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 
+import hudson.model.FreeStyleProject;
+import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.Queue;
 import hudson.plugins.ec2.ConnectionStrategy;
 import hudson.plugins.ec2.EC2AbstractSlave;
 import hudson.plugins.ec2.EC2Cloud;
 import hudson.plugins.ec2.EC2Computer;
 import hudson.plugins.ec2.EbsEncryptRootVolume;
 import hudson.plugins.ec2.HotSpareConfigByLabel;
+import hudson.plugins.ec2.HotSpareDemand;
 import hudson.plugins.ec2.SlaveTemplate;
 import hudson.plugins.ec2.Tenancy;
 import java.security.Security;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import jenkins.model.Jenkins;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -35,6 +45,8 @@ class LabelHotSpareCheckerTest {
 
     private JenkinsRule r;
 
+    private MovableClock clock;
+
     @BeforeEach
     void setUp(JenkinsRule rule) {
         r = rule;
@@ -42,6 +54,15 @@ class LabelHotSpareCheckerTest {
         // The mock client and its instance list are static, so a fresh one keeps the instances of
         // one test from counting against the caps of the next.
         AmazonEC2FactoryMockImpl.mock = AmazonEC2FactoryMockImpl.createAmazonEC2Mock();
+        clock = new MovableClock();
+        HotSpareDemand.clock = clock;
+        HotSpareDemand.reset();
+    }
+
+    @AfterEach
+    void tearDown() {
+        HotSpareDemand.clock = Clock.systemDefaultZone();
+        HotSpareDemand.reset();
     }
 
     /**
@@ -120,20 +141,81 @@ class LabelHotSpareCheckerTest {
         assertThat(countAgents(), equalTo(0));
     }
 
+    /**
+     * The reported defect: a step of 5 used to hand out five agents once and then let the label
+     * drain, because the target was derived from the queue and the queue empties as soon as the
+     * builds start. The target has to survive the queue emptying, and the spares consumed have to
+     * be replaced.
+     */
     @Test
-    void testDesiredCountUsesTheBaseTheScalingFactorAndTheCeiling() {
-        HotSpareConfigByLabel rule = rule(2, 3, null);
+    void testSparesAreReplacedAsTheyAreConsumed() throws Exception {
+        HotSpareConfigByLabel rule = rule(0, 5, null);
+        SlaveTemplate template = template("only", 20);
+        // Replacements have to be new instances here, or the mock hands back the ones the departed
+        // agents left behind and the test cannot tell provisioning from adoption.
+        template.setAvoidUsingOrphanedNodes(true);
+        EC2Cloud cloud = cloud(rule, template);
+        // A burst the label could not keep up with, which is what raises the target to five.
+        HotSpareDemand.of(cloud, LABEL).updateTarget(rule, 0, 0, 5, 0);
 
-        assertThat(
-                "the base applies with an empty queue", MinimumInstanceChecker.desiredHotSpares(rule, 0), equalTo(2));
-        assertThat(
-                "scaling wins once it exceeds the base", MinimumInstanceChecker.desiredHotSpares(rule, 2), equalTo(6));
+        MinimumInstanceChecker.checkForMinimumInstances();
+        assertThat(countAgents(), equalTo(5));
 
-        rule.setMaxHotSpares(4);
-        assertThat("the ceiling clamps the scaled value", MinimumInstanceChecker.desiredHotSpares(rule, 2), equalTo(4));
+        // The builds take all five, so the label holds nothing warm again.
+        removeAllAgents();
+        MinimumInstanceChecker.checkForMinimumInstances();
 
-        rule.setMaxHotSpares(1);
-        assertThat("the ceiling also clamps the base", MinimumInstanceChecker.desiredHotSpares(rule, 0), equalTo(1));
+        assertThat("the five spares should have been replaced", countAgents(), equalTo(5));
+        assertThat("five more instances launched", AmazonEC2FactoryMockImpl.instances.size(), equalTo(10));
+    }
+
+    /**
+     * Nothing has asked for the label for longer than the idle timeout, so it should stop paying
+     * for spares altogether rather than holding the level its last burst asked for.
+     */
+    @Test
+    void testAQuietLabelStopsReplacingSpares() throws Exception {
+        HotSpareConfigByLabel rule = rule(0, 5, null);
+        rule.setIdleTimeoutMinutes(15);
+        EC2Cloud cloud = cloud(rule, template("only", 20));
+        HotSpareDemand.of(cloud, LABEL).updateTarget(rule, 0, 0, 5, 0);
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+        assertThat(countAgents(), equalTo(5));
+
+        removeAllAgents();
+        clock.advanceMinutes(16);
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat("the prediction should have faded to nothing", countAgents(), equalTo(0));
+        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(0));
+    }
+
+    /**
+     * A build waiting for the label is the signal the loop runs on, so a queued build alone warms
+     * the label up from nothing.
+     */
+    @Test
+    void testAQueuedBuildWarmsTheLabelUpFromNothing() throws Exception {
+        HotSpareConfigByLabel rule = rule(0, 3, null);
+        EC2Cloud cloud = cloud(rule, template("only", 20));
+
+        r.jenkins.setQuietPeriod(0);
+        FreeStyleProject project = r.createFreeStyleProject();
+        project.setAssignedLabel(Label.get(LABEL));
+        project.scheduleBuild2(0);
+        Queue.getInstance().maintain();
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(countAgents(), equalTo(3));
+        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(3));
+    }
+
+    private void removeAllAgents() throws Exception {
+        for (Node node : new ArrayList<>(r.jenkins.getNodes())) {
+            r.jenkins.removeNode(node);
+        }
     }
 
     private static HotSpareConfigByLabel rule(int baseHotSpares, int scalingFactor, Integer maxHotSpares) {
@@ -166,6 +248,35 @@ class LabelHotSpareCheckerTest {
         cloud.setHotSpareConfigsByLabel(List.of(rule));
         r.jenkins.clouds.add(cloud);
         return cloud;
+    }
+
+    private static final class MovableClock extends Clock {
+
+        private long millis = TimeUnit.DAYS.toMillis(1);
+
+        void advanceMinutes(long minutes) {
+            millis += TimeUnit.MINUTES.toMillis(minutes);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneId.systemDefault();
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return Instant.ofEpochMilli(millis);
+        }
+
+        @Override
+        public long millis() {
+            return millis;
+        }
     }
 
     private static SlaveTemplate template(String description, int instanceCap) {

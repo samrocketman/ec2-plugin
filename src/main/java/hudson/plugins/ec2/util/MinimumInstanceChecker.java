@@ -10,6 +10,7 @@ import hudson.plugins.ec2.EC2AbstractSlave;
 import hudson.plugins.ec2.EC2Cloud;
 import hudson.plugins.ec2.EC2Computer;
 import hudson.plugins.ec2.HotSpareConfigByLabel;
+import hudson.plugins.ec2.HotSpareDemand;
 import hudson.plugins.ec2.SlaveTemplate;
 import java.time.Clock;
 import java.time.LocalDateTime;
@@ -134,6 +135,16 @@ public class MinimumInstanceChecker {
     }
 
     /**
+     * @return the number of agents of the label group running a build. They are not spares, which
+     *     is why a spare taken by a build is replaced, but they do say the label is in use.
+     */
+    public static int countCurrentNumberOfBusyAgentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
+        return (int) agentsForLabel(cloud, label)
+                .filter(computer -> !computer.isIdle())
+                .count();
+    }
+
+    /**
      * @return the number of buildable queue items any template of the label group could serve.
      */
     public static int countQueueItemsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
@@ -235,8 +246,13 @@ public class MinimumInstanceChecker {
      *
      * <p>A rule owns the spare count for its label, so a template's
      * {@link SlaveTemplate#getMinimumNumberOfSpareInstances()} no longer applies to the templates
-     * the rule covers. Instances already provisioning are subtracted, otherwise every tick would
-     * re-provision the same shortfall while the previous batch is still booting.
+     * the rule covers.
+     *
+     * <p>Only idle agents count towards the target, so a spare taken by a build is replaced on the
+     * next pass and the label stays warm for the whole of a busy period instead of draining with
+     * the first few builds. Instances already on their way are subtracted as well, otherwise every
+     * pass would re-provision the same shortfall while the previous batch is still booting.
+     * {@link HotSpareDemand} decides what the target itself should be.
      */
     private static void checkForLabelHotSpares(@NonNull EC2Cloud cloud) {
         for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
@@ -252,30 +268,24 @@ public class MinimumInstanceChecker {
 
             int currentSpares = countCurrentNumberOfSpareAgentsForLabel(cloud, label);
             int currentProvisioning = countCurrentNumberOfProvisioningAgentsForLabel(cloud, label);
+            int busyAgents = countCurrentNumberOfBusyAgentsForLabel(cloud, label);
             int queuedBuilds = countQueueItemsForLabel(cloud, label);
 
-            int desired = desiredHotSpares(config, queuedBuilds);
-            int toLaunch = desired - (currentSpares + currentProvisioning);
+            int target = HotSpareDemand.of(cloud, labelName)
+                    .updateTarget(config, currentSpares, currentProvisioning, queuedBuilds, busyAgents);
+            int toLaunch = target - (currentSpares + currentProvisioning);
 
             LOGGER.log(
                     Level.FINE,
-                    "Hot spares for label {0}: desired={1}, spare={2}, provisioning={3}, queued={4}, toLaunch={5}",
-                    new Object[] {labelName, desired, currentSpares, currentProvisioning, queuedBuilds, toLaunch});
+                    "Hot spares for label {0}: target={1}, spare={2}, provisioning={3}, busy={4}, queued={5}, toLaunch={6}",
+                    new Object[] {
+                        labelName, target, currentSpares, currentProvisioning, busyAgents, queuedBuilds, toLaunch
+                    });
 
             if (toLaunch > 0) {
                 provisionAcrossLabelGroup(cloud, label, matching, toLaunch);
             }
         }
-    }
-
-    /**
-     * How many spares a label should hold. The base count applies even with an empty queue, which
-     * is what makes them <em>hot</em> spares, and the ceiling applies to the label group as a whole.
-     */
-    static int desiredHotSpares(@NonNull HotSpareConfigByLabel config, int queuedBuilds) {
-        int desired = Math.max(config.getBaseHotSpares(), config.getScalingFactor() * queuedBuilds);
-        Integer maxHotSpares = config.getMaxHotSpares();
-        return maxHotSpares == null ? desired : Math.min(desired, maxHotSpares);
     }
 
     /**
