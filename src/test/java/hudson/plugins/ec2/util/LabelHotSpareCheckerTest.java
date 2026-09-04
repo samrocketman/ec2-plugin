@@ -273,6 +273,30 @@ class LabelHotSpareCheckerTest {
         return (EC2RetentionStrategy) node.getRetentionStrategy();
     }
 
+    /**
+     * A build fanning out to twenty parallel branches puts twenty tasks in the queue at once, and
+     * that is measured demand rather than a guess. The label goes to twenty on the spot instead of
+     * climbing there five at a time over four minutes with nineteen branches waiting.
+     */
+    @Test
+    void testAWideParallelBuildWarmsTheLabelToItsWholeWidth() throws Exception {
+        HotSpareConfigByLabel rule = rule(0, 5, null);
+        EC2Cloud cloud = cloud(rule, template("only", 30));
+
+        r.jenkins.setQuietPeriod(0);
+        for (int branch = 0; branch < 20; branch++) {
+            FreeStyleProject project = r.createFreeStyleProject();
+            project.setAssignedLabel(Label.get(LABEL));
+            project.scheduleBuild2(0);
+        }
+        Queue.getInstance().maintain();
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(20));
+        assertThat(countAgents(), equalTo(20));
+    }
+
     private void removeAllAgents() throws Exception {
         for (Node node : new ArrayList<>(r.jenkins.getNodes())) {
             r.jenkins.removeNode(node);
@@ -304,8 +328,9 @@ class LabelHotSpareCheckerTest {
 
     private EC2Cloud cloud(HotSpareConfigByLabel rule, SlaveTemplate... templates) throws Exception {
         SSHCredentialHelper.assureSshCredentialAvailableThroughCredentialProviders("ghi");
-        EC2Cloud cloud =
-                new EC2Cloud("test-cloud", true, "abc", "us-east-1", null, "ghi", "20", List.of(templates), null, null);
+        // A cloud-wide cap high enough to leave the template caps as the only limit in play.
+        EC2Cloud cloud = new EC2Cloud(
+                "test-cloud", true, "abc", "us-east-1", null, "ghi", "100", List.of(templates), null, null);
         cloud.setHotSpareConfigsByLabel(List.of(rule));
         r.jenkins.clouds.add(cloud);
         return cloud;

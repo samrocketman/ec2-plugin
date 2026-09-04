@@ -112,15 +112,11 @@ class HotSpareDemandTest {
         assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
 
         clock.advanceMinutes(1);
-        for (int i = 0; i < 5; i++) {
-            HotSpareDemand.spareConsumed(cloud, config);
-        }
+        consume(config, 5);
         assertThat("nothing warm is left, so hold more of it", demand.updateTarget(config, 0, 5, 0, 6), equalTo(10));
 
         clock.advanceMinutes(1);
-        for (int i = 0; i < 5; i++) {
-            HotSpareDemand.spareConsumed(cloud, config);
-        }
+        consume(config, 5);
         assertThat(demand.updateTarget(config, 0, 10, 0, 11), equalTo(15));
     }
 
@@ -158,9 +154,7 @@ class HotSpareDemandTest {
 
         for (int minute = 0; minute < 10; minute++) {
             clock.advanceMinutes(1);
-            for (int taken = 0; taken < 5; taken++) {
-                HotSpareDemand.spareConsumed(cloud, config);
-            }
+            consume(config, 5);
             demand.updateTarget(config, 0, 5, 0, 5);
         }
 
@@ -204,20 +198,54 @@ class HotSpareDemandTest {
     }
 
     /**
-     * The label cannot keep up, so the target climbs a step at a time: 5, 10, 15, 20.
+     * The demand of a big parallel build is measurable the moment its branches queue up, so the
+     * target goes straight to it. Climbing there a step per minute would leave nineteen of twenty
+     * branches waiting for the first four minutes, which is the opposite of the point.
      */
     @Test
-    void testTheTargetGrowsAStepAtATimeWhileTheSparesCannotKeepUp() {
+    void testABigParallelBuildRaisesTheTargetToItsWholeWidthAtOnce() {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 30, 0), equalTo(5));
+        assertThat(demand.updateTarget(config, 0, 0, 20, 0), equalTo(20));
+    }
+
+    /**
+     * The load, not the step, is what the target follows once the label is in use, whether the work
+     * is queued or already running.
+     */
+    @Test
+    void testTheTargetFollowsTheLoadUpAndTheStepIsOnlyItsFloor() {
+        HotSpareConfigByLabel config = rule(0, 5, null);
+        HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
+
+        assertThat("less work in sight than a step: the step wins", demand.updateTarget(config, 0, 0, 2, 0), equalTo(5));
+        assertThat("eight branches waiting", demand.updateTarget(config, 0, 5, 8, 0), equalTo(8));
+        assertThat("and now they are running", demand.updateTarget(config, 0, 0, 0, 8), equalTo(8));
+        assertThat("a second job joins them", demand.updateTarget(config, 0, 8, 6, 8), equalTo(14));
+    }
+
+    /**
+     * Following the load covers the work in sight. This covers the work that has not arrived yet: a
+     * label whose spares are taken the instant they appear is given one step more than its load,
+     * and no more, because a load that is not growing is not evidence of anything beyond that.
+     */
+    @Test
+    void testALabelThatKeepsRunningDryIsGivenAStepMoreThanItsLoad() {
+        HotSpareConfigByLabel config = rule(0, 5, null);
+        HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
+
+        // Five builds running, and every spare that appears is taken straight away.
+        consume(config, 5);
+        assertThat(demand.updateTarget(config, 0, 0, 0, 5), equalTo(5));
+
         clock.advanceMinutes(1);
-        assertThat(demand.updateTarget(config, 0, 5, 30, 0), equalTo(10));
+        consume(config, 5);
+        assertThat("a step of cover above the five it is running", demand.updateTarget(config, 0, 5, 0, 5), equalTo(10));
+
         clock.advanceMinutes(1);
-        assertThat(demand.updateTarget(config, 0, 10, 30, 0), equalTo(15));
-        clock.advanceMinutes(1);
-        assertThat(demand.updateTarget(config, 0, 15, 30, 0), equalTo(20));
+        consume(config, 5);
+        assertThat("and no further while the load stands still", demand.updateTarget(config, 0, 10, 0, 5), equalTo(10));
     }
 
     /**
@@ -237,22 +265,25 @@ class HotSpareDemandTest {
     }
 
     /**
-     * Checks are also triggered by events such as a build starting, so a burst must not be able to
-     * step the target up several times before the first instances have had a chance to boot.
+     * A pass runs every time a build starts, so the same load seen several times over must not read
+     * as more load. The measured part of the target is idempotent and the cover is rate-limited.
      */
     @Test
-    void testRepeatedChecksWithinAMinuteOnlyGrowTheTargetOnce() {
+    void testRepeatedChecksWithTheSameLoadDoNotKeepClimbing() {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 50, 0), equalTo(5));
+        assertThat(demand.updateTarget(config, 0, 0, 50, 0), equalTo(50));
         clock.advanceSeconds(5);
-        assertThat(demand.updateTarget(config, 0, 0, 50, 0), equalTo(5));
+        assertThat(demand.updateTarget(config, 0, 50, 50, 0), equalTo(50));
         clock.advanceSeconds(5);
-        assertThat(demand.updateTarget(config, 0, 0, 50, 0), equalTo(5));
+        assertThat(demand.updateTarget(config, 0, 50, 50, 0), equalTo(50));
 
         clock.advanceMinutes(1);
-        assertThat(demand.updateTarget(config, 0, 0, 50, 0), equalTo(10));
+        assertThat(
+                "a minute on with the queue still unserved, so a step of cover",
+                demand.updateTarget(config, 0, 0, 50, 0),
+                equalTo(55));
     }
 
     /**
@@ -265,9 +296,7 @@ class HotSpareDemandTest {
         config.setIdleTimeoutMinutes(15);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 20, 0), equalTo(5));
-        clock.advanceMinutes(1);
-        assertThat(demand.updateTarget(config, 0, 5, 20, 0), equalTo(10));
+        assertThat(demand.updateTarget(config, 0, 0, 10, 0), equalTo(10));
 
         // The work stops. The first quiet check only starts the clock.
         assertThat(demand.updateTarget(config, 10, 0, 0, 0), equalTo(10));
@@ -309,9 +338,7 @@ class HotSpareDemandTest {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 30, 0), equalTo(5));
-        clock.advanceMinutes(1);
-        assertThat(demand.updateTarget(config, 0, 5, 30, 0), equalTo(10));
+        assertThat(demand.updateTarget(config, 0, 0, 10, 0), equalTo(10));
 
         HotSpareDemand.spareReclaimed(cloud, config);
         assertThat(demand.getTarget(), equalTo(5));
@@ -326,9 +353,7 @@ class HotSpareDemandTest {
         HotSpareConfigByLabel config = rule(0, 5, 7);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 40, 0), equalTo(5));
-        clock.advanceMinutes(1);
-        assertThat(demand.updateTarget(config, 0, 5, 40, 0), equalTo(7));
+        assertThat("forty queued builds, but seven is the limit", demand.updateTarget(config, 0, 0, 40, 0), equalTo(7));
         clock.advanceMinutes(1);
         assertThat(demand.updateTarget(config, 0, 7, 40, 0), equalTo(7));
     }
@@ -352,17 +377,17 @@ class HotSpareDemandTest {
     }
 
     /**
-     * A rule with no step would otherwise be stuck at its base count forever, unable to react to
-     * anything.
+     * A rule with no step still follows its load; the step only sets how much cover it gets on top,
+     * and one is the least that can move at all.
      */
     @Test
-    void testARuleWithNoStepStillMovesByOne() {
+    void testARuleWithNoStepStillFollowsItsLoadAndCoversItByOne() {
         HotSpareConfigByLabel config = rule(0, 0, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 10, 0), equalTo(1));
+        assertThat(demand.updateTarget(config, 0, 0, 10, 0), equalTo(10));
         clock.advanceMinutes(1);
-        assertThat(demand.updateTarget(config, 0, 1, 10, 0), equalTo(2));
+        assertThat(demand.updateTarget(config, 0, 0, 10, 0), equalTo(11));
     }
 
     /**
@@ -375,7 +400,7 @@ class HotSpareDemandTest {
         config.setIdleTimeoutMinutes(0);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 10, 0), equalTo(5));
+        assertThat(demand.updateTarget(config, 0, 0, 5, 0), equalTo(5));
         assertThat(demand.updateTarget(config, 5, 0, 0, 0), equalTo(5));
         clock.advanceMinutes(HotSpareConfigByLabel.DEFAULT_IDLE_TIMEOUT_MINUTES);
         assertThat(demand.updateTarget(config, 5, 0, 0, 0), equalTo(0));
@@ -391,7 +416,7 @@ class HotSpareDemandTest {
         config.setIdleTimeoutMinutes(-10);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 10, 0), equalTo(5));
+        assertThat(demand.updateTarget(config, 0, 0, 5, 0), equalTo(5));
         assertThat(demand.updateTarget(config, 5, 0, 0, 0), equalTo(5));
         clock.advanceMinutes(10);
         assertThat(demand.updateTarget(config, 5, 0, 0, 0), equalTo(0));
@@ -403,9 +428,15 @@ class HotSpareDemandTest {
         HotSpareConfigByLabel windows = new HotSpareConfigByLabel("windows");
         windows.setScalingFactor(2);
 
-        assertThat(HotSpareDemand.of(cloud, LABEL).updateTarget(linux, 0, 0, 10, 0), equalTo(5));
-        assertThat(HotSpareDemand.of(cloud, "windows").updateTarget(windows, 0, 0, 10, 0), equalTo(2));
-        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(5));
+        assertThat(HotSpareDemand.of(cloud, LABEL).updateTarget(linux, 0, 0, 10, 0), equalTo(10));
+        assertThat(HotSpareDemand.of(cloud, "windows").updateTarget(windows, 0, 0, 3, 0), equalTo(3));
+        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(10));
+    }
+
+    private void consume(HotSpareConfigByLabel config, int spares) {
+        for (int i = 0; i < spares; i++) {
+            HotSpareDemand.spareConsumed(cloud, config);
+        }
     }
 
     private static HotSpareConfigByLabel rule(int baseHotSpares, int step, Integer maxHotSpares) {

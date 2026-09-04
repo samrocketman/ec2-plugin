@@ -48,14 +48,16 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  *       spares, which is how a label warms up from nothing without waiting for builds to pile up;
  *   <li>every spare taken by a build is replaced, because a busy agent is not a spare. This is what
  *       keeps a label warm for the whole of a busy period rather than for the first few builds;
+ *   <li>past that first step, the target is the work the label has in sight: the builds queued for
+ *       it plus the agents running one. A single build fanning out to 20 parallel branches asks for
+ *       20 spares at once rather than climbing there a step per minute, because the demand is
+ *       already measurable;
  *   <li>when the pool runs dry anyway, or builds are waiting that neither the spares nor the
- *       instances already on their way can take, the target grows by
- *       {@link HotSpareConfigByLabel#getScalingFactor()}, so a label that cannot keep up climbs 5,
- *       10, 15, 20 until it does;
- *   <li>while builds are running or queued the target is held, so a label that has found its level
- *       stays there;
- *   <li>growth stops at the work in sight, so a label whose instance caps are already reached
- *       does not accumulate a backlog it would try to launch all at once later;
+ *       instances already on their way can take, the target is raised a further
+ *       {@link HotSpareConfigByLabel#getScalingFactor()} above the load, once per interval, until
+ *       the spares do keep up;
+ *   <li>the load plus one step is also the limit, so a label whose instance caps are already
+ *       reached does not accumulate a backlog it would try to launch all at once later;
  *   <li>a spare reclaimed by the idle timeout means the target overshot, so it comes back down by
  *       the same step. A label with nothing to do also steps down once per idle timeout, which
  *       drains it to {@link HotSpareConfigByLabel#getBaseHotSpares()} - zero by default - rather
@@ -108,7 +110,9 @@ public final class HotSpareDemand {
     }
 
     /**
-     * Moves the target in response to what the label looks like right now.
+     * Moves the target in response to what the label looks like right now: at least one step while
+     * it is in use, the work in sight once that is larger, and a step more than that while the
+     * spares are not keeping up.
      *
      * @param spares idle agents of the label group that could take work immediately.
      * @param provisioning instances of the label group on their way to becoming spares.
@@ -124,47 +128,43 @@ public final class HotSpareDemand {
         final int consumed = consumedSinceLastPass;
         consumedSinceLastPass = 0;
 
-        target = Math.max(target, base);
+        // The work the label has in sight: what is waiting for it and what it is already running.
+        final int load = queued + busy;
+        final boolean inUse = consumed > 0 || load > 0;
 
         /*
          * Two things say the spares are not keeping up: builds took the last of the pool, and builds
          * are waiting that neither the spares nor the instances already on their way can take.
-         * Counting what is in flight is what makes the loop settle, so a burst grows the target once
-         * per interval until the instances already coming cover it.
+         * Counting what is in flight is what makes this settle rather than chase a queue that
+         * instances are already on their way to serve.
          */
-        boolean ranDry = consumed > 0 && spares == 0;
-        boolean queueUnserved = queued > spares + provisioning;
-        boolean inUse = consumed > 0 || busy > 0 || queued > 0;
+        final boolean ranDry = consumed > 0 && spares == 0;
+        final boolean queueUnserved = queued > spares + provisioning;
+
+        target = Math.max(target, base);
 
         if (inUse) {
             quietSinceMillis = 0;
-        }
 
-        if (consumed > 0 && target < step) {
             /*
-             * The label has started being used, so it should be holding spares. Warming up to one
-             * step counts as this round's growth: going from quiet to busy should not jump two steps
-             * just because the first build also found the pool empty.
+             * The load is a measurement, so it is followed at once: a build fanning out to 20
+             * branches needs 20 spares now, not in four minutes' worth of steps. The step is the
+             * floor rather than the rate, for the label that has only just been asked for anything.
              */
-            LOGGER.log(Level.FINE, "Label {0} is in use again, warming up to {1} spare(s)", new Object[] {
-                config.getLabel(), step
-            });
-            target = Math.min(ceiling(config), step);
-            lastGrowthMillis = now;
-        } else if (ranDry || queueUnserved) {
-            if (now - lastGrowthMillis >= GROWTH_INTERVAL_MS) {
+            int wanted = Math.max(step, load);
+
+            if ((ranDry || queueUnserved) && now - lastGrowthMillis >= GROWTH_INTERVAL_MS) {
+                /*
+                 * The load is being served too slowly even so, so hold a step more than the load
+                 * until it is not. One step per interval, because provisioning is not instant and a
+                 * pass runs every time a build starts.
+                 */
                 lastGrowthMillis = now;
-                int grown = Math.min(Math.min(ceiling(config), demandCeiling(config, queued, busy)), target + step);
-                if (grown > target) {
-                    LOGGER.log(
-                            Level.FINE,
-                            "Hot spares for {0} are not keeping up ({1} taken, {2} left, {3} queued), "
-                                    + "raising the target from {4} to {5}",
-                            new Object[] {config.getLabel(), consumed, spares, queued, target, grown});
-                    target = grown;
-                }
+                wanted = Math.max(wanted, Math.min(load + step, target + step));
             }
-        } else if (!inUse) {
+
+            raiseTo(config, wanted, consumed, spares, queued);
+        } else {
             if (quietSinceMillis == 0) {
                 quietSinceMillis = now;
             } else if (now - quietSinceMillis >= decayIntervalMillis(config)) {
@@ -175,6 +175,18 @@ public final class HotSpareDemand {
 
         target = Math.min(target, ceiling(config));
         return target;
+    }
+
+    private void raiseTo(HotSpareConfigByLabel config, int wanted, int consumed, int spares, int queued) {
+        int raised = Math.min(ceiling(config), wanted);
+        if (raised > target) {
+            LOGGER.log(
+                    Level.FINE,
+                    "Raising the hot spare target for {0} from {1} to {2} ({3} taken since the last pass, "
+                            + "{4} still warm, {5} queued)",
+                    new Object[] {config.getLabel(), target, raised, consumed, spares, queued});
+            target = raised;
+        }
     }
 
     /**
@@ -243,16 +255,6 @@ public final class HotSpareDemand {
     private static int ceiling(HotSpareConfigByLabel config) {
         Integer max = config.getMaxHotSpares();
         return max == null ? Integer.MAX_VALUE : Math.max(0, max);
-    }
-
-    /**
-     * @return how far the work in sight can justify growing to: what the label is being asked for,
-     *     plus one step of cover for what arrives next. Without this, a label whose templates are
-     *     all at their instance caps would keep failing to keep up and keep growing, and would then
-     *     try to launch that whole imagined backlog the moment capacity appeared.
-     */
-    private static int demandCeiling(HotSpareConfigByLabel config, int queued, int busy) {
-        return Math.max(config.getBaseHotSpares(), queued + busy + growthStep(config));
     }
 
     /**
