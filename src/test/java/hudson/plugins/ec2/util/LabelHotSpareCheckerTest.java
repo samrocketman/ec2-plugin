@@ -2,13 +2,17 @@ package hudson.plugins.ec2.util;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.notNullValue;
 
+import hudson.ExtensionList;
 import hudson.model.Executor;
 import hudson.model.FreeStyleProject;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.Queue;
+import hudson.model.queue.CauseOfBlockage;
+import hudson.model.queue.QueueTaskDispatcher;
 import hudson.plugins.ec2.ConnectionStrategy;
 import hudson.plugins.ec2.EC2AbstractSlave;
 import hudson.plugins.ec2.EC2Cloud;
@@ -19,6 +23,7 @@ import hudson.plugins.ec2.HotSpareConfigByLabel;
 import hudson.plugins.ec2.HotSpareDemand;
 import hudson.plugins.ec2.SlaveTemplate;
 import hudson.plugins.ec2.Tenancy;
+import hudson.slaves.NodeProvisioner;
 import java.security.Security;
 import java.time.Clock;
 import java.time.Instant;
@@ -35,6 +40,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
 
@@ -45,6 +51,25 @@ import software.amazon.awssdk.services.ec2.model.InstanceType;
 class LabelHotSpareCheckerTest {
 
     private static final String LABEL = "linux";
+
+    /**
+     * No test here wants a build to actually start: what is being measured is the spares a queue
+     * warms up, and a branch being picked up by an agent moves it out of the queue and the agent
+     * out of the pool, mid-count. Vetoing every assignment keeps the queue still.
+     */
+    @TestExtension
+    public static class KeepEveryBuildQueued extends QueueTaskDispatcher {
+
+        @Override
+        public CauseOfBlockage canTake(Node node, Queue.BuildableItem item) {
+            return new CauseOfBlockage() {
+                @Override
+                public String getShortDescription() {
+                    return "held in the queue by LabelHotSpareCheckerTest";
+                }
+            };
+        }
+    }
 
     private JenkinsRule r;
 
@@ -60,6 +85,11 @@ class LabelHotSpareCheckerTest {
         clock = new MovableClock();
         HotSpareDemand.clock = clock;
         HotSpareDemand.reset();
+        // Jenkins provisions for a queued build on its own account, off a timer, and these tests now
+        // react to the same queue. Its agents would be indistinguishable from spares in the counts
+        // below, so the tests that use a real build measure only what the hot spare pass launched.
+        ExtensionList<NodeProvisioner.Strategy> strategies = r.jenkins.getExtensionList(NodeProvisioner.Strategy.class);
+        strategies.removeAll(new ArrayList<>(strategies));
     }
 
     @AfterEach
@@ -195,11 +225,13 @@ class LabelHotSpareCheckerTest {
     }
 
     /**
-     * A build waiting for the label is the signal the loop runs on, so a queued build alone warms
-     * the label up from nothing.
+     * The label with nothing warm is the case the spares exist for, and it is the one case the
+     * agents cannot report themselves: with no capacity, no executor is taken. Queueing a build has
+     * to be enough on its own, or the first build of the day waits for the periodic sweep before
+     * anything is even asked for.
      */
     @Test
-    void testAQueuedBuildWarmsTheLabelUpFromNothing() throws Exception {
+    void testQueueingABuildProvisionsSparesWithoutWaitingForASweep() throws Exception {
         HotSpareConfigByLabel rule = rule(0, 3, null);
         EC2Cloud cloud = cloud(rule, template("only", 20));
 
@@ -207,10 +239,11 @@ class LabelHotSpareCheckerTest {
         FreeStyleProject project = r.createFreeStyleProject();
         project.setAssignedLabel(Label.get(LABEL));
         project.scheduleBuild2(0);
+
+        // Only what Jenkins does by itself: the queue is maintained, which makes the build buildable.
         Queue.getInstance().maintain();
 
-        MinimumInstanceChecker.checkForMinimumInstances();
-
+        waitForAtLeastAgents(3);
         assertThat(countAgents(), equalTo(3));
         assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(3));
     }
@@ -239,24 +272,29 @@ class LabelHotSpareCheckerTest {
 
         /*
          * Nothing else has happened: no queued build, no periodic pass, and the clock has not moved.
-         * The agent above still reports itself idle because no real build runs in this harness, so
-         * it counts as one of the two spares the label now wants and one more is launched.
+         * The agent above counts as one of the two the label now wants, so one more is launched.
          */
-        waitForInstanceCount(launchedBefore + 1);
-        assertThat(countAgents(), equalTo(2));
+        waitForAtLeastAgents(2);
         assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(2));
+        assertThat(
+                "one launch, not a whole pool",
+                AmazonEC2FactoryMockImpl.instances.size(),
+                equalTo(launchedBefore + 1));
     }
 
     /**
-     * The replacement is provisioned off the executor thread, so it is not there the instant
-     * {@code taskAccepted} returns.
+     * Hot spare passes run off the thread that triggered them, so their agents are not there the
+     * instant a build is queued or an executor is taken.
+     *
+     * <p>Waits for the number of spares asked for, and no longer: a label serving builds ends up
+     * with more agents than that, because the agents running those builds are not spares.
      */
-    private static void waitForInstanceCount(int expected) throws Exception {
+    private static void waitForAtLeastAgents(int expected) throws Exception {
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
-        while (AmazonEC2FactoryMockImpl.instances.size() < expected && System.currentTimeMillis() < deadline) {
+        while (countAgents() < expected && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);
         }
-        assertThat(AmazonEC2FactoryMockImpl.instances.size(), equalTo(expected));
+        assertThat("the hot spare pass should have provisioned by now", countAgents(), greaterThanOrEqualTo(expected));
     }
 
     private static EC2Computer onlyAgent() {
@@ -291,10 +329,9 @@ class LabelHotSpareCheckerTest {
         }
         Queue.getInstance().maintain();
 
-        MinimumInstanceChecker.checkForMinimumInstances();
-
-        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(20));
+        waitForAtLeastAgents(20);
         assertThat(countAgents(), equalTo(20));
+        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(20));
     }
 
     private void removeAllAgents() throws Exception {

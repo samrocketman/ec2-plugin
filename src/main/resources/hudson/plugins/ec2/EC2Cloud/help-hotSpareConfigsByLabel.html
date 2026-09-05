@@ -8,9 +8,12 @@
     uses &mdash; so with <i>Round-robin templates matching the same label</i> enabled, their <i>Hot
     spare weight</i> applies here too.</p>
 
-    <p>The number of spares is a prediction rather than a fixed setting. A spare taken by a build is
-    replaced as its executor is taken, so the next spare is booting while that build runs and the
-    label stays warm for the whole of a busy period instead of draining. Beyond the first step, the
+    <p>The number of spares is a prediction rather than a fixed setting, and it is revisited as soon
+    as a build is queued for the label or takes an executor on one of its agents, rather than on a
+    timer. A build queued for a label with nothing warm has its spares requested immediately, and
+    starts on whichever of them comes up first. A spare taken by a build is replaced as its executor
+    is taken, so the next spare is booting while that build runs and the label stays warm for the
+    whole of a busy period instead of draining. Beyond the first step, the
     number follows the work in sight: the builds queued for the label plus the agents running one, so
     a build fanning out to 20 branches warms 20 spares at once. If the spares are still being taken
     the instant they appear, the target is given one step of cover above that load. When spares go

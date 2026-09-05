@@ -6,9 +6,10 @@ import hudson.plugins.ec2.util.MinimumInstanceChecker;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Keeps hot spare counts current between the events that already trigger a check (a task being
- * accepted, or the ten-minute {@link EC2SlaveMonitor} sweep), so a label rule reacts to a queue
- * that grew without any agent changing state.
+ * Keeps hot spare counts current between the events that already trigger a check (a build becoming
+ * buildable, a task being accepted, or the ten-minute {@link EC2SlaveMonitor} sweep). Those cover
+ * the cases that matter for latency; this is the backstop that lets a label fade away when nothing
+ * is happening at all.
  *
  * <p>This deliberately makes no provisioning decisions of its own: they all belong in the one
  * synchronized {@link MinimumInstanceChecker#checkForMinimumInstances()} pass.

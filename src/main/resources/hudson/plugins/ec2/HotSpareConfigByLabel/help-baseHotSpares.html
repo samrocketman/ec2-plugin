@@ -7,6 +7,7 @@
     standing cost of the label.</p>
 
     <p>0 lets the label scale all the way to nothing when it is idle. The first build after a quiet
-    period then waits for an instance, and that build starting is what warms the label back up to
-    one <i>Hot spare step</i> so the builds behind it do not have to wait too.</p>
+    period still has to wait for an instance, but queueing it asks for a whole <i>Hot spare step</i>
+    of agents there and then, so it starts on whichever of them comes up first and the builds behind
+    it find the rest already waiting.</p>
 </div>

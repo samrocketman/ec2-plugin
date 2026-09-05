@@ -105,10 +105,15 @@ public class MinimumInstanceChecker {
         return (int) idleAgents(agentTemplate).filter(Computer::isOnline).count();
     }
 
+    /**
+     * @return the number of agents of this template that exist but cannot take work yet. Counted
+     *     from attachment rather than from the launcher starting, for the reason given on
+     *     {@link #countCurrentNumberOfProvisioningAgentsForLabel}.
+     */
     public static int countCurrentNumberOfProvisioningAgents(@NonNull SlaveTemplate agentTemplate) {
         return (int) idleAgents(agentTemplate)
                 .filter(Computer::isOffline)
-                .filter(Computer::isConnecting)
+                .filter(computer -> !computer.isTemporarilyOffline())
                 .count();
     }
 
@@ -149,11 +154,19 @@ public class MinimumInstanceChecker {
                 .count();
     }
 
+    /**
+     * @return the number of agents of the label group that exist but cannot take work yet.
+     *     <p>An agent is counted from the moment it is attached rather than from the moment its
+     *     launcher starts, because {@link Computer#isConnecting()} is false for the gap in between
+     *     and two passes falling either side of that gap would launch the same shortfall twice.
+     *     Passes are triggered by builds queueing and starting, so they do arrive in quick
+     *     succession. An agent that never comes up is dealt with by its grace period.
+     */
     public static int countCurrentNumberOfProvisioningAgentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
         return (int) agentsForLabel(cloud, label)
                 .filter(Computer::isIdle)
                 .filter(Computer::isOffline)
-                .filter(Computer::isConnecting)
+                .filter(computer -> !computer.isTemporarilyOffline())
                 .count();
     }
 
