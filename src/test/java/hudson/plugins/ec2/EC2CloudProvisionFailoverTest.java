@@ -17,6 +17,7 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.jvnet.hudson.test.Issue;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import org.mockito.Mockito;
@@ -29,6 +30,8 @@ import software.amazon.awssdk.services.ec2.model.RunInstancesRequest;
  * Failover between the templates matching one label. The group is homogeneous by definition, so a
  * template that cannot deliver must hand over to the next one inside the same provisioning request
  * instead of costing a whole {@link hudson.slaves.NodeProvisioner} cycle.
+ *
+ * @see <a href="https://github.com/jenkinsci/ec2-plugin/issues/2033">ec2-plugin issue 2033</a>
  */
 @WithJenkins
 class EC2CloudProvisionFailoverTest {
@@ -51,6 +54,7 @@ class EC2CloudProvisionFailoverTest {
      * call by launching from the second, and the exhausted template is demoted for a while.
      */
     @Test
+    @Issue("2033")
     void testCapacityErrorFailsOverToNextTemplateAndCoolsDownTheFirst() throws Exception {
         failRunInstancesFor(FIRST_TYPE, () -> capacityException("InsufficientInstanceCapacity"));
         SlaveTemplate first = template("first", FIRST_TYPE);
@@ -72,6 +76,7 @@ class EC2CloudProvisionFailoverTest {
      * reorder later requests, stays off.
      */
     @Test
+    @Issue("2033")
     void testCapacityErrorFailsOverWithRotationDisabledButRecordsNoCooldown() throws Exception {
         failRunInstancesFor(FIRST_TYPE, () -> capacityException("InsufficientInstanceCapacity"));
         SlaveTemplate first = template("first", FIRST_TYPE);
@@ -92,6 +97,7 @@ class EC2CloudProvisionFailoverTest {
      * rather than looping on the first one.
      */
     @Test
+    @Issue("2033")
     void testEveryRequestStillDeliversWhileTheFirstTemplateKeepsFailing() throws Exception {
         failRunInstancesFor(FIRST_TYPE, () -> capacityException("InsufficientInstanceCapacity"));
         SlaveTemplate first = template("first", FIRST_TYPE);
@@ -119,6 +125,7 @@ class EC2CloudProvisionFailoverTest {
      * the first one into a capacity cooldown.
      */
     @Test
+    @Issue("2033")
     void testNonCapacityErrorFailsOverWithoutCooldown() throws Exception {
         failRunInstancesFor(FIRST_TYPE, () -> capacityException("UnauthorizedOperation"));
         SlaveTemplate first = template("first", FIRST_TYPE);
