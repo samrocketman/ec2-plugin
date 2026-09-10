@@ -677,7 +677,6 @@ public class EC2Cloud extends Cloud {
         if (this.lastCountedInstanceIds == null) {
             this.lastCountedInstanceIds = Collections.emptySet();
         }
-        this.rotation = new LabelTemplateRotation(this::isRoundRobinTemplatesByLabel);
         if (this.hotSpareConfigsByLabel == null) {
             this.hotSpareConfigsByLabel = new ArrayList<>();
         }

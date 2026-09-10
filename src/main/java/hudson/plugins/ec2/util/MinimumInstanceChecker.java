@@ -210,7 +210,12 @@ public class MinimumInstanceChecker {
             return false;
         }
 
-        List<EC2Computer> spares = agentsForLabel(cloud, Label.get(labelName))
+        Label label = Label.get(labelName);
+        if (label == null) {
+            return false;
+        }
+
+        List<EC2Computer> spares = agentsForLabel(cloud, label)
                 .filter(MinimumInstanceChecker::isSpare)
                 .collect(Collectors.toCollection(ArrayList::new));
         if (spares.stream().noneMatch(spare -> spare == computer)) {
@@ -371,6 +376,9 @@ public class MinimumInstanceChecker {
                 continue;
             }
             Label label = Label.get(labelName);
+            if (label == null) {
+                continue;
+            }
             Collection<SlaveTemplate> matching = cloud.getTemplates(label);
             if (matching.isEmpty()) {
                 continue;

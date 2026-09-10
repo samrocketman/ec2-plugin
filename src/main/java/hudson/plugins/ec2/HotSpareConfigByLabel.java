@@ -199,8 +199,10 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
             return false;
         }
         // The same test EC2Cloud#getTemplates(Label) uses, so a rule governs exactly the templates
-        // that label would provision from.
-        return Label.get(label).matches(template.getLabelSet());
+        // that label would provision from. Jenkins has no label for a blank expression, in which
+        // case the rule governs nothing.
+        Label parsed = Label.get(label);
+        return parsed != null && parsed.matches(template.getLabelSet());
     }
 
     @Extension
