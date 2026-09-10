@@ -18,6 +18,7 @@ import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -149,9 +150,61 @@ public class MinimumInstanceChecker {
 
     public static int countCurrentNumberOfSpareAgentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
         return (int) agentsForLabel(cloud, label)
-                .filter(Computer::isIdle)
-                .filter(Computer::isOnline)
+                .filter(MinimumInstanceChecker::isSpare)
                 .count();
+    }
+
+    /**
+     * @return whether an agent is warm capacity the label can hand to the next build. An agent that
+     *     has drained its maximum number of uses is idle and online but stops accepting tasks, so
+     *     counting it would let a pool of agents that can never run anything satisfy the target.
+     */
+    private static boolean isSpare(@NonNull EC2Computer computer) {
+        return computer.isIdle()
+                && computer.isOnline()
+                && computer.isAcceptingTasks()
+                && !computer.isTemporarilyOffline();
+    }
+
+    /**
+     * Whether the hot spare prediction for a label is still counting on this agent, which is the
+     * question the idle timeout has to ask before reclaiming it. Terminating a spare the target
+     * wants pays for the same capacity twice - once for the instance thrown away, again for the one
+     * the next pass launches in its place - and leaves a build waiting for the boot in between.
+     *
+     * <p>The spares are ranked by how long each has been idle and the freshest {@code target} of
+     * them are kept, so several agents asking at once agree on which are the extras and exactly the
+     * surplus is released. Releasing the longest-idle first keeps the behaviour of an idle timeout:
+     * the agent that has been sitting unused the longest is the one that goes.
+     *
+     * <p>The agent being asked about is included whether or not the counted set has caught up with
+     * it, because the comparison is meaningless if the pool it is ranked against excludes it.
+     *
+     * @return true when the label wants this agent kept warm, false when it is surplus, is not warm
+     *     capacity at all, or the label wants no spares.
+     */
+    public static boolean isSpareStillWanted(
+            @NonNull EC2Cloud cloud, @NonNull HotSpareConfigByLabel config, @NonNull EC2Computer computer) {
+        String labelName = config.getLabel();
+        if (labelName == null || labelName.isBlank()) {
+            return false;
+        }
+        int target = HotSpareDemand.of(cloud, labelName).getTarget();
+        if (target <= 0 || !isSpare(computer)) {
+            return false;
+        }
+
+        List<EC2Computer> spares = agentsForLabel(cloud, Label.get(labelName))
+                .filter(MinimumInstanceChecker::isSpare)
+                .collect(Collectors.toCollection(ArrayList::new));
+        if (spares.stream().noneMatch(spare -> spare == computer)) {
+            spares.add(computer);
+        }
+        if (spares.size() <= target) {
+            return true;
+        }
+        spares.sort(Comparator.comparingLong(Computer::getIdleStartMilliseconds).thenComparing(Computer::getName));
+        return spares.subList(spares.size() - target, spares.size()).stream().anyMatch(spare -> spare == computer);
     }
 
     /**

@@ -915,12 +915,13 @@ class EC2RetentionStrategyTest {
     }
 
     /**
-     * A spare that went unused for a whole idle timeout means the hot spare prediction for its
-     * label overshot, so reclaiming it lowers the target. Without this the label would immediately
-     * provision a replacement for the agent it just gave up.
+     * A spare the label's target is still counting on outlives its idle timeout. Reclaiming it
+     * would pay for the same capacity twice, once for the instance thrown away and again for the
+     * one the very next pass provisions in its place, and leave a build waiting for the boot in
+     * between.
      */
     @Test
-    void testReclaimingAnIdleSpareLowersTheHotSpareTargetForItsLabel() throws Exception {
+    void testAnIdleSpareTheTargetStillWantsIsNotReclaimed() throws Exception {
         final int RETENTION_MINUTES = 5;
         HotSpareConfigByLabel rule = new HotSpareConfigByLabel("ttt");
         rule.setScalingFactor(5);
@@ -943,11 +944,46 @@ class EC2RetentionStrategyTest {
                         checkTime.toEpochMilli())
                 .check(computerWithUpTime(20, 0, false, false, readyAt.toEpochMilli()));
 
-        assertThat("the idle spare should have been reclaimed", idleTimeoutCalled.get(), equalTo(true));
         assertThat(
-                "the target should have given back a step",
+                "the spare should have been kept for the label that is still counting on it",
+                idleTimeoutCalled.get(),
+                equalTo(false));
+        assertThat(
+                "keeping a wanted spare should not move the target",
                 HotSpareDemand.of(cloud, "ttt").getTarget(),
-                equalTo(0));
+                equalTo(5));
+    }
+
+    /**
+     * Once the target has faded below the number of spares on hand, the extras are exactly what the
+     * idle timeout is for. This is what lets a label scale to nothing: the target reaches its base
+     * count and every spare above it is released.
+     */
+    @Test
+    void testAnIdleSpareTheTargetHasGivenUpOnIsReclaimed() throws Exception {
+        final int RETENTION_MINUTES = 5;
+        HotSpareConfigByLabel rule = new HotSpareConfigByLabel("ttt");
+        rule.setScalingFactor(5);
+        rule.setIdleTimeoutMinutes(RETENTION_MINUTES);
+        EC2Cloud cloud =
+                new EC2Cloud("cloud", true, "abc", "us-east-1", null, "ghi", "20", Collections.emptyList(), null, null);
+        cloud.setHotSpareConfigsByLabel(List.of(rule));
+        r.jenkins.clouds.add(cloud);
+        HotSpareDemand.reset();
+        // Quiet label, base count of zero: the prediction wants nothing kept warm.
+        assertThat(HotSpareDemand.of(cloud, "ttt").updateTarget(rule, 1, 0, 0, 0), equalTo(0));
+
+        final int BOOT_MINUTES = 5;
+        final Instant readyAt = Instant.now().plus(Duration.ofMinutes(BOOT_MINUTES));
+        final Instant checkTime = Instant.now().plus(Duration.ofMinutes(BOOT_MINUTES + RETENTION_MINUTES + 1));
+
+        new EC2RetentionStrategy(
+                        String.format("%d", RETENTION_MINUTES),
+                        Clock.fixed(checkTime.plusSeconds(1), zoneId),
+                        checkTime.toEpochMilli())
+                .check(computerWithUpTime(20, 0, false, false, readyAt.toEpochMilli()));
+
+        assertThat("the surplus spare should have been reclaimed", idleTimeoutCalled.get(), equalTo(true));
     }
 
     /**

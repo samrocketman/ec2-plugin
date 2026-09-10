@@ -322,7 +322,9 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                     LOGGER.log(Level.FINE, "Error checking queue for " + computer.getName(), e);
                     queueHasItemsForSlave = true; // safe default: do not terminate
                 }
-                if (idleMilliseconds > TimeUnit.MINUTES.toMillis(effectiveIdleMinutes) && !queueHasItemsForSlave) {
+                if (idleMilliseconds > TimeUnit.MINUTES.toMillis(effectiveIdleMinutes)
+                        && !queueHasItemsForSlave
+                        && !keptAsHotSpare(computer)) {
 
                     LOGGER.info("Idle timeout of " + computer.getName() + " after "
                             + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, instance status"
@@ -331,7 +333,6 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                     if (slaveNode != null) {
                         try {
                             Queue.withLock(slaveNode::idleTimeout);
-                            noteReclaimedSpare(computer);
                         } catch (Exception e) {
                             LOGGER.log(Level.FINE, "Error idle timeout for " + computer.getName(), e);
                         }
@@ -356,7 +357,8 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                     queueHasItemsForSlaveBilling = true;
                 }
                 if (freeSecondsLeft <= TimeUnit.MINUTES.toSeconds(Math.abs(effectiveIdleMinutes))
-                        && !queueHasItemsForSlaveBilling) {
+                        && !queueHasItemsForSlaveBilling
+                        && !keptAsHotSpare(computer)) {
                     LOGGER.info("Idle timeout of " + computer.getName() + " after "
                             + TimeUnit.MILLISECONDS.toMinutes(idleMilliseconds) + " idle minutes, with "
                             + TimeUnit.SECONDS.toMinutes(freeSecondsLeft)
@@ -365,7 +367,6 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
                     if (slaveNode != null) {
                         try {
                             Queue.withLock(slaveNode::idleTimeout);
-                            noteReclaimedSpare(computer);
                         } catch (Exception e) {
                             LOGGER.log(Level.FINE, "Error idle timeout for " + computer.getName(), e);
                         }
@@ -377,24 +378,30 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
     }
 
     /**
-     * Tells the hot spare prediction for every label covering this agent that a spare went unused
-     * for a whole idle timeout, so the target comes down instead of replacing what was just given
-     * up.
+     * @return whether a hot spare rule is still counting on this agent, in which case the idle
+     *     timeout leaves it alone. The target is the authority on how many spares a label holds, so
+     *     an agent is only reclaimed once the target has come down past it; letting the timeout
+     *     reclaim it first would just have the next pass provision a replacement.
      */
-    private static void noteReclaimedSpare(EC2Computer computer) {
+    private static boolean keptAsHotSpare(EC2Computer computer) {
         EC2Cloud cloud = cloudOf(computer);
         if (cloud == null) {
-            return;
+            return false;
         }
         SlaveTemplate template = templateOf(computer);
         if (template == null) {
-            return;
+            return false;
         }
         for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
-            if (config.matches(template)) {
-                HotSpareDemand.spareReclaimed(cloud, config);
+            if (config.matches(template) && MinimumInstanceChecker.isSpareStillWanted(cloud, config, computer)) {
+                LOGGER.log(
+                        Level.FINE,
+                        "Keeping {0} past its idle timeout: the hot spares for {1} are still counting on it",
+                        new Object[] {computer.getName(), config.getLabel()});
+                return true;
             }
         }
+        return false;
     }
 
     /**

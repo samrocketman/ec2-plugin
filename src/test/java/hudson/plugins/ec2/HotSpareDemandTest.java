@@ -219,7 +219,8 @@ class HotSpareDemandTest {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat("less work in sight than a step: the step wins", demand.updateTarget(config, 0, 0, 2, 0), equalTo(5));
+        assertThat(
+                "less work in sight than a step: the step wins", demand.updateTarget(config, 0, 0, 2, 0), equalTo(5));
         assertThat("eight branches waiting", demand.updateTarget(config, 0, 5, 8, 0), equalTo(8));
         assertThat("and now they are running", demand.updateTarget(config, 0, 0, 0, 8), equalTo(8));
         assertThat("a second job joins them", demand.updateTarget(config, 0, 8, 6, 8), equalTo(14));
@@ -241,7 +242,8 @@ class HotSpareDemandTest {
 
         clock.advanceMinutes(1);
         consume(config, 5);
-        assertThat("a step of cover above the five it is running", demand.updateTarget(config, 0, 5, 0, 5), equalTo(10));
+        assertThat(
+                "a step of cover above the five it is running", demand.updateTarget(config, 0, 5, 0, 5), equalTo(10));
 
         clock.advanceMinutes(1);
         consume(config, 5);
@@ -330,22 +332,50 @@ class HotSpareDemandTest {
     }
 
     /**
-     * A spare that sat unused for a whole idle timeout says the target overshot. Stepping down as
-     * they are reclaimed is what stops the label replacing the agents it is giving up.
+     * A burst teaches the label a peak that later work does not justify. The target has to fade
+     * back towards the work still in sight, otherwise the spares it holds would never be reclaimed:
+     * the idle timeout only releases the agents the target has given up on.
      */
     @Test
-    void testAReclaimedSpareLowersTheTarget() {
+    void testTheTargetFadesTowardsTheLoadWhileTheLabelStaysBusy() {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
-        assertThat(demand.updateTarget(config, 0, 0, 10, 0), equalTo(10));
+        assertThat("a twenty-branch burst", demand.updateTarget(config, 0, 0, 20, 0), equalTo(20));
 
-        HotSpareDemand.spareReclaimed(cloud, config);
-        assertThat(demand.getTarget(), equalTo(5));
-        HotSpareDemand.spareReclaimed(cloud, config);
-        assertThat(demand.getTarget(), equalTo(0));
-        HotSpareDemand.spareReclaimed(cloud, config);
-        assertThat("nothing below the base count", demand.getTarget(), equalTo(0));
+        // The burst is over, but two builds keep the label in use. The first pass only starts the clock.
+        assertThat(demand.updateTarget(config, 18, 0, 0, 2), equalTo(20));
+        clock.advanceMinutes(14);
+        assertThat("not a whole idle timeout yet", demand.updateTarget(config, 18, 0, 0, 2), equalTo(20));
+        clock.advanceMinutes(1);
+        assertThat(demand.updateTarget(config, 18, 0, 0, 2), equalTo(15));
+        clock.advanceMinutes(15);
+        assertThat(demand.updateTarget(config, 13, 0, 0, 2), equalTo(10));
+        clock.advanceMinutes(15);
+        assertThat(demand.updateTarget(config, 8, 0, 0, 2), equalTo(5));
+        clock.advanceMinutes(15);
+        assertThat(
+                "one step is the floor while the label is in use", demand.updateTarget(config, 3, 0, 0, 2), equalTo(5));
+    }
+
+    /**
+     * Work picking back up during the fade takes the target with it, so a label that is busy again
+     * does not carry on giving up spares it is about to need.
+     */
+    @Test
+    void testWorkComingBackDuringTheFadeStopsIt() {
+        HotSpareConfigByLabel config = rule(0, 5, null);
+        HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
+
+        assertThat(demand.updateTarget(config, 0, 0, 20, 0), equalTo(20));
+        assertThat(demand.updateTarget(config, 18, 0, 0, 2), equalTo(20));
+        clock.advanceMinutes(15);
+        assertThat(demand.updateTarget(config, 18, 0, 0, 2), equalTo(15));
+
+        clock.advanceMinutes(15);
+        assertThat("eighteen running builds", demand.updateTarget(config, 0, 0, 0, 18), equalTo(18));
+        clock.advanceMinutes(15);
+        assertThat("the fade restarts from the new peak", demand.updateTarget(config, 0, 0, 0, 18), equalTo(18));
     }
 
     @Test

@@ -58,11 +58,16 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  *       the spares do keep up;
  *   <li>the load plus one step is also the limit, so a label whose instance caps are already
  *       reached does not accumulate a backlog it would try to launch all at once later;
- *   <li>a spare reclaimed by the idle timeout means the target overshot, so it comes back down by
- *       the same step. A label with nothing to do also steps down once per idle timeout, which
- *       drains it to {@link HotSpareConfigByLabel#getBaseHotSpares()} - zero by default - rather
- *       than paying for spares nothing is asking for.
+ *   <li>the target comes down a step per idle timeout, either towards the work still in sight while
+ *       the label is in use, or to {@link HotSpareConfigByLabel#getBaseHotSpares()} - zero by
+ *       default - once nothing is asking for the label at all, rather than paying for spares
+ *       nothing wants.
  * </ul>
+ *
+ * <p>The target, not the idle timeout, is what decides how many spares a label keeps: an agent is
+ * only reclaimed once the target has come down past it. Letting the timeout reclaim a spare the
+ * target still wanted would pay for the same capacity twice, because the very next pass would
+ * provision a replacement for it.
  *
  * <p>The target is deliberately not persisted: after a restart the label starts from its base count
  * and learns again within a few minutes, which is safer than restoring a number that described a
@@ -91,6 +96,9 @@ public final class HotSpareDemand {
 
     /** When the label was first seen with nothing to do, or 0 while it has work. */
     private long quietSinceMillis;
+
+    /** When the load first came in under the target, or 0 while the target is not above it. */
+    private long overshotSinceMillis;
 
     /** Spares taken by builds since the last pass, counted by {@link #spareConsumed}. */
     private int consumedSinceLastPass;
@@ -163,13 +171,34 @@ public final class HotSpareDemand {
                 wanted = Math.max(wanted, Math.min(load + step, target + step));
             }
 
-            raiseTo(config, wanted, consumed, spares, queued);
+            if (wanted > target) {
+                raiseTo(config, wanted, consumed, spares, queued);
+                overshotSinceMillis = 0;
+            } else if (wanted < target) {
+                /*
+                 * The label is still in use but with less work than the target holds, so the peak it
+                 * learned from an earlier burst has to fade. It fades a step at a time rather than
+                 * dropping to the load, because the spares above the load are what the next burst
+                 * lands on, and because the agents themselves are only worth giving up at the rate
+                 * the admin set as the idle timeout.
+                 */
+                if (overshotSinceMillis == 0) {
+                    overshotSinceMillis = now;
+                } else if (now - overshotSinceMillis >= decayIntervalMillis(config)) {
+                    overshotSinceMillis = now;
+                    stepDownTo(config, wanted, "the label has held less work than the target for a whole idle timeout");
+                }
+            } else {
+                overshotSinceMillis = 0;
+            }
         } else {
             if (quietSinceMillis == 0) {
                 quietSinceMillis = now;
+                overshotSinceMillis = 0;
             } else if (now - quietSinceMillis >= decayIntervalMillis(config)) {
                 quietSinceMillis = now;
-                stepDown(config, "nothing has asked for the label for a whole idle timeout");
+                stepDownTo(
+                        config, config.getBaseHotSpares(), "nothing has asked for the label for a whole idle timeout");
             }
         }
 
@@ -210,32 +239,17 @@ public final class HotSpareDemand {
         }
     }
 
-    /**
-     * Reports that a spare of this label was reclaimed for being idle, which means the target was
-     * higher than the work needed and should come down.
-     *
-     * <p>Stepping down here rather than only on a timer is what stops a label from replacing the
-     * spares it is in the middle of giving up: the step is the same size as the growth step, so it
-     * outruns the agents timing out one by one.
-     */
-    public static void spareReclaimed(@NonNull EC2Cloud cloud, @NonNull HotSpareConfigByLabel config) {
-        String label = config.getLabel();
-        if (label == null) {
-            return;
-        }
-        HotSpareDemand demand = of(cloud, label);
-        synchronized (demand) {
-            demand.quietSinceMillis = clock.millis();
-            demand.stepDown(config, "an idle spare was reclaimed");
-        }
-    }
-
     public synchronized int getTarget() {
         return target;
     }
 
-    private void stepDown(HotSpareConfigByLabel config, String why) {
-        int lowered = Math.max(config.getBaseHotSpares(), target - growthStep(config));
+    /**
+     * Gives up one step of target, stopping at {@code floor} or the base count, whichever is
+     * higher. The target is what decides how many spares a label keeps, so nothing terminates an
+     * agent until this has come down past it.
+     */
+    private void stepDownTo(HotSpareConfigByLabel config, int floor, String why) {
+        int lowered = Math.max(Math.max(config.getBaseHotSpares(), floor), target - growthStep(config));
         if (lowered != target) {
             LOGGER.log(Level.FINE, "Lowering the hot spare target for {0} from {1} to {2}: {3}", new Object[] {
                 config.getLabel(), target, lowered, why

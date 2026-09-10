@@ -277,9 +277,7 @@ class LabelHotSpareCheckerTest {
         waitForAtLeastAgents(2);
         assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(2));
         assertThat(
-                "one launch, not a whole pool",
-                AmazonEC2FactoryMockImpl.instances.size(),
-                equalTo(launchedBefore + 1));
+                "one launch, not a whole pool", AmazonEC2FactoryMockImpl.instances.size(), equalTo(launchedBefore + 1));
     }
 
     /**

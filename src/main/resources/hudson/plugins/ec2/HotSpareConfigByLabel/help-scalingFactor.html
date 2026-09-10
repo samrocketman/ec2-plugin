@@ -14,10 +14,12 @@
     above the load, and no further while the load stands still. So a label running 5 builds that
     keeps emptying its pool settles at 10, and one running 20 settles at 25.</p>
 
-    <p>The target comes back down by the same step: once for every spare that sits unused for a
-    whole <i>Idle termination time</i>, and once per idle termination time while nothing at all is
-    asking for the label. That drains the label to <i>Base hot spares</i> &mdash; zero by default
-    &mdash; so an idle Jenkins pays for nothing.</p>
+    <p>The target comes back down by the same step, once per <i>Idle termination time</i>: towards
+    the work still in sight while the label is in use, so the peak learned from a burst does not
+    outlive it, and to <i>Base hot spares</i> &mdash; zero by default &mdash; once nothing at all is
+    asking for the label, so an idle Jenkins pays for nothing. Agents are reclaimed as the target
+    passes them, which means a pool holding exactly what the target asks for is never recycled just
+    to be provisioned again.</p>
 
     <p>A spare taken by a build is replaced the moment its executor is taken, because a busy agent
     is not a spare: the replacement boots while that build runs, which is what keeps the label warm
