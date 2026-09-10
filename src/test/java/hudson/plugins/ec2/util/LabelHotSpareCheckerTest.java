@@ -141,8 +141,10 @@ class LabelHotSpareCheckerTest {
         HotSpareConfigByLabel rule = rule(2, 0, null);
         SlaveTemplate template = template("only", 10);
         template.setMinimumNumberOfInstancesTimeRangeConfig(window("11:00", "15:00"));
-        cloud(rule, template);
+        // Before the cloud is saved: saving one runs a hot spare pass, which would read the
+        // schedules against whatever the wall clock happens to say.
         atLocalTime(18, 0);
+        cloud(rule, template);
 
         MinimumInstanceChecker.checkForMinimumInstances();
 
@@ -158,8 +160,8 @@ class LabelHotSpareCheckerTest {
         HotSpareConfigByLabel rule = rule(2, 0, null);
         SlaveTemplate template = template("only", 10);
         template.setMinimumNumberOfInstancesTimeRangeConfig(window("11:00", "15:00"));
-        cloud(rule, template);
         atLocalTime(12, 0);
+        cloud(rule, template);
 
         MinimumInstanceChecker.checkForMinimumInstances();
 
@@ -179,13 +181,70 @@ class LabelHotSpareCheckerTest {
         dayShift.setMinimumNumberOfInstancesTimeRangeConfig(window("08:00", "18:00"));
         SlaveTemplate nightShift = template("night", 10);
         nightShift.setMinimumNumberOfInstancesTimeRangeConfig(window("18:00", "08:00"));
-        cloud(rule, dayShift, nightShift);
         atLocalTime(22, 0);
+        cloud(rule, dayShift, nightShift);
 
         MinimumInstanceChecker.checkForMinimumInstances();
 
         assertThat(countAgents(), equalTo(2));
         assertThat(agentsByTemplate(), equalTo(Map.of("night", 2L)));
+    }
+
+    /**
+     * A template carrying several labels can be covered by a rule for each of them. The rules are
+     * counted against the same agents rather than added together, so the label wanting the most
+     * decides how many the template holds and the other one adds nothing.
+     */
+    @Test
+    void testOverlappingRulesDoNotAddUpOnASharedTemplate() throws Exception {
+        // The smaller rule first, since that is also the order the idle timeout is resolved in.
+        EC2Cloud cloud = cloud(List.of(rule("bar", 1), rule("foo", 4)), template("shared", 10, "foo bar"));
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat("four for foo, of which bar's one is a subset", countAgents(), equalTo(4));
+        assertThat(HotSpareDemand.of(cloud, "foo").getTarget(), equalTo(4));
+        assertThat(HotSpareDemand.of(cloud, "bar").getTarget(), equalTo(1));
+    }
+
+    /**
+     * The other half of that: overlapping is not the same as sharing everything, so a rule provisions
+     * only from the templates carrying its own label.
+     */
+    @Test
+    void testARuleOnlyProvisionsFromTheTemplatesItCovers() throws Exception {
+        cloud(
+                List.of(rule("foo", 2), rule("baz", 3)),
+                template("shared", 10, "foo bar"),
+                template("elsewhere", 10, "baz"));
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(agentsByTemplate(), equalTo(Map.of("shared", 2L, "elsewhere", 3L)));
+    }
+
+    /**
+     * Work in sight is counted through the templates of the group, so a build asking for one label
+     * of a shared template is demand for every rule covering it. The labels are not independent
+     * signals when they are the same machines.
+     */
+    @Test
+    void testWorkForOneLabelIsWorkInSightForEveryRuleCoveringTheTemplate() throws Exception {
+        EC2Cloud cloud = cloud(List.of(rule("bar", 0), rule("foo", 0)), template("shared", 10, "foo bar"));
+
+        r.jenkins.setQuietPeriod(0);
+        FreeStyleProject project = r.createFreeStyleProject();
+        project.setAssignedLabel(Label.get("bar"));
+        project.scheduleBuild2(0);
+        Queue.getInstance().maintain();
+        waitForABuildableItem();
+
+        assertThat(MinimumInstanceChecker.countQueueItemsForLabel(cloud, Label.get("bar")), equalTo(1));
+        assertThat(
+                "a build asking for bar is work in sight for foo as well",
+                MinimumInstanceChecker.countQueueItemsForLabel(cloud, Label.get("foo")),
+                equalTo(1));
     }
 
     /**
@@ -347,6 +406,18 @@ class LabelHotSpareCheckerTest {
      * <p>Waits for the number of spares asked for, and no longer: a label serving builds ends up
      * with more agents than that, because the agents running those builds are not spares.
      */
+    private static void waitForABuildableItem() throws Exception {
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
+        while (Queue.getInstance().getBuildableItems().isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+            Queue.getInstance().maintain();
+        }
+        assertThat(
+                "the build should have reached the queue by now",
+                Queue.getInstance().getBuildableItems().size(),
+                greaterThanOrEqualTo(1));
+    }
+
     private static void waitForAtLeastAgents(int expected) throws Exception {
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
         while (countAgents() < expected && System.currentTimeMillis() < deadline) {
@@ -423,6 +494,14 @@ class LabelHotSpareCheckerTest {
                 Clock.fixed(when.atZone(ZoneId.systemDefault()).toInstant(), ZoneId.systemDefault());
     }
 
+    /** A rule for another label, with a fixed count and no scaling of its own. */
+    private static HotSpareConfigByLabel rule(String label, int baseHotSpares) {
+        HotSpareConfigByLabel rule = new HotSpareConfigByLabel(label);
+        rule.setBaseHotSpares(baseHotSpares);
+        rule.setScalingFactor(0);
+        return rule;
+    }
+
     private static HotSpareConfigByLabel rule(int baseHotSpares, int scalingFactor, Integer maxHotSpares) {
         HotSpareConfigByLabel rule = new HotSpareConfigByLabel(LABEL);
         rule.setBaseHotSpares(baseHotSpares);
@@ -447,11 +526,15 @@ class LabelHotSpareCheckerTest {
     }
 
     private EC2Cloud cloud(HotSpareConfigByLabel rule, SlaveTemplate... templates) throws Exception {
+        return cloud(List.of(rule), templates);
+    }
+
+    private EC2Cloud cloud(List<HotSpareConfigByLabel> rules, SlaveTemplate... templates) throws Exception {
         SSHCredentialHelper.assureSshCredentialAvailableThroughCredentialProviders("ghi");
         // A cloud-wide cap high enough to leave the template caps as the only limit in play.
         EC2Cloud cloud = new EC2Cloud(
                 "test-cloud", true, "abc", "us-east-1", null, "ghi", "100", List.of(templates), null, null);
-        cloud.setHotSpareConfigsByLabel(List.of(rule));
+        cloud.setHotSpareConfigsByLabel(rules);
         r.jenkins.clouds.add(cloud);
         return cloud;
     }
@@ -486,6 +569,10 @@ class LabelHotSpareCheckerTest {
     }
 
     private static SlaveTemplate template(String description, int instanceCap) {
+        return template(description, instanceCap, LABEL);
+    }
+
+    private static SlaveTemplate template(String description, int instanceCap, String labels) {
         return new SlaveTemplate(
                 "ami-" + description,
                 EC2AbstractSlave.TEST_ZONE,
@@ -494,7 +581,7 @@ class LabelHotSpareCheckerTest {
                 "/tmp/jenkins",
                 InstanceType.M1_LARGE.toString(),
                 false,
-                LABEL,
+                labels,
                 Node.Mode.NORMAL,
                 description,
                 "",

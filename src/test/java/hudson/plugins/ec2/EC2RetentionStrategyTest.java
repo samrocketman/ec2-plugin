@@ -566,6 +566,10 @@ class EC2RetentionStrategyTest {
      * as a template saved without an explicit idle termination time would be.
      */
     private static SlaveTemplate templateWithIdleTermination(String idleTerminationMinutes) {
+        return templateWithIdleTermination(idleTerminationMinutes, "ttt");
+    }
+
+    private static SlaveTemplate templateWithIdleTermination(String idleTerminationMinutes, String labels) {
         return new SlaveTemplate(
                 "ami-123",
                 EC2AbstractSlave.TEST_ZONE,
@@ -574,7 +578,7 @@ class EC2RetentionStrategyTest {
                 "foo",
                 InstanceType.M1_LARGE.toString(),
                 false,
-                "ttt",
+                labels,
                 Node.Mode.NORMAL,
                 "AMI description",
                 "bar",
@@ -985,6 +989,76 @@ class EC2RetentionStrategyTest {
                 .check(computerWithUpTime(20, 0, false, false, readyAt.toEpochMilli()));
 
         assertThat("the surplus spare should have been reclaimed", idleTimeoutCalled.get(), equalTo(true));
+    }
+
+    /**
+     * A template carrying several labels can be covered by a rule for each of them, and they will
+     * not agree about how many spares are wanted. The agent is kept while any of them is still
+     * counting on it, so a small rule cannot take away what a bigger one is holding.
+     */
+    @Test
+    void testASpareOneRuleStillWantsIsKeptFromARuleThatHasGivenUp() throws Exception {
+        final int RETENTION_MINUTES = 5;
+        // Listed first, so the rule that has given up is also the one the idle timeout comes from.
+        HotSpareConfigByLabel small = hotSpareRule("other", RETENTION_MINUTES);
+        HotSpareConfigByLabel big = hotSpareRule("ttt", RETENTION_MINUTES);
+        EC2Cloud cloud = cloudWithHotSpareRules(List.of(small, big));
+        assertThat(HotSpareDemand.of(cloud, "other").updateTarget(small, 1, 0, 0, 0), equalTo(0));
+        assertThat(HotSpareDemand.of(cloud, "ttt").updateTarget(big, 0, 0, 5, 0), equalTo(5));
+
+        checkASpare(RETENTION_MINUTES, templateWithIdleTermination(null, "ttt other"));
+
+        assertThat(
+                "the label still counting on the spare should have kept it", idleTimeoutCalled.get(), equalTo(false));
+    }
+
+    /**
+     * The other side of that: being covered by several rules is not itself a reason to keep an
+     * agent, so once every one of them has given up it goes.
+     */
+    @Test
+    void testASpareIsReclaimedOnceEveryRuleCoveringItHasGivenUp() throws Exception {
+        final int RETENTION_MINUTES = 5;
+        HotSpareConfigByLabel small = hotSpareRule("other", RETENTION_MINUTES);
+        HotSpareConfigByLabel big = hotSpareRule("ttt", RETENTION_MINUTES);
+        EC2Cloud cloud = cloudWithHotSpareRules(List.of(small, big));
+        assertThat(HotSpareDemand.of(cloud, "other").updateTarget(small, 1, 0, 0, 0), equalTo(0));
+        assertThat(HotSpareDemand.of(cloud, "ttt").updateTarget(big, 1, 0, 0, 0), equalTo(0));
+
+        checkASpare(RETENTION_MINUTES, templateWithIdleTermination(null, "ttt other"));
+
+        assertThat("no rule wants the spare any more", idleTimeoutCalled.get(), equalTo(true));
+    }
+
+    private static HotSpareConfigByLabel hotSpareRule(String label, int idleTimeoutMinutes) {
+        HotSpareConfigByLabel rule = new HotSpareConfigByLabel(label);
+        rule.setScalingFactor(5);
+        rule.setIdleTimeoutMinutes(idleTimeoutMinutes);
+        return rule;
+    }
+
+    /** The mock agents report cloudName "cloud", which is how the strategy finds the rules. */
+    private EC2Cloud cloudWithHotSpareRules(List<HotSpareConfigByLabel> rules) {
+        EC2Cloud cloud =
+                new EC2Cloud("cloud", true, "abc", "us-east-1", null, "ghi", "20", Collections.emptyList(), null, null);
+        cloud.setHotSpareConfigsByLabel(rules);
+        r.jenkins.clouds.add(cloud);
+        HotSpareDemand.reset();
+        return cloud;
+    }
+
+    /** Runs a retention check on an agent that has been idle well past its termination time. */
+    private void checkASpare(int retentionMinutes, SlaveTemplate template) throws Exception {
+        final int BOOT_MINUTES = 5;
+        final Instant readyAt = Instant.now().plus(Duration.ofMinutes(BOOT_MINUTES));
+        final Instant checkTime = Instant.now().plus(Duration.ofMinutes(BOOT_MINUTES + retentionMinutes + 1));
+
+        new EC2RetentionStrategy(
+                        String.format("%d", retentionMinutes),
+                        Clock.fixed(checkTime.plusSeconds(1), zoneId),
+                        checkTime.toEpochMilli())
+                .check(computerWithUpTime(
+                        20, 0, false, false, readyAt.toEpochMilli(), 0L, Integer.MAX_VALUE, template));
     }
 
     /**

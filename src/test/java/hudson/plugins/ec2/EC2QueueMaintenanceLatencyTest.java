@@ -16,20 +16,19 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import jenkins.model.Jenkins;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
+import org.mockito.AdditionalAnswers;
 import org.mockito.Mockito;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.DescribeInstancesRequest;
-import software.amazon.awssdk.services.ec2.model.DescribeInstancesResponse;
 import software.amazon.awssdk.services.ec2.model.DescribeSpotInstanceRequestsRequest;
-import software.amazon.awssdk.services.ec2.model.DescribeSpotInstanceRequestsResponse;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
 import software.amazon.awssdk.services.ec2.model.RunInstancesRequest;
-import software.amazon.awssdk.services.ec2.model.RunInstancesResponse;
 
 /**
  * Queue maintenance must never wait on EC2. {@code Queue.maintain()} runs under the Queue lock and
@@ -50,6 +49,9 @@ class EC2QueueMaintenanceLatencyTest {
     private static final long EC2_CALL_DELAY_MS = TimeUnit.SECONDS.toMillis(5);
     private static final long BUDGET_MS = TimeUnit.SECONDS.toMillis(2);
 
+    /** Whether the EC2 client is currently answering slowly. Flipped once the setup is done. */
+    private static final AtomicBoolean SLOWED = new AtomicBoolean();
+
     private JenkinsRule r;
     private EC2Cloud cloud;
 
@@ -57,7 +59,8 @@ class EC2QueueMaintenanceLatencyTest {
     void setUp(JenkinsRule rule) throws Exception {
         r = rule;
         Security.addProvider(new org.bouncycastle.jce.provider.BouncyCastleProvider());
-        AmazonEC2FactoryMockImpl.mock = AmazonEC2FactoryMockImpl.createAmazonEC2Mock();
+        SLOWED.set(false);
+        AmazonEC2FactoryMockImpl.mock = slowableEc2Client();
 
         HotSpareConfigByLabel rule2 = new HotSpareConfigByLabel(LABEL);
         rule2.setBaseHotSpares(1);
@@ -66,7 +69,7 @@ class EC2QueueMaintenanceLatencyTest {
 
         // An agent, provisioned while EC2 is still quick to answer.
         cloud.provision(cloud.getTemplates().get(0), 1);
-        slowDownEveryEc2Call();
+        SLOWED.set(true);
 
         // A queued build, so maintenance has something to think about. Everything the queue sets
         // off from here on, including a hot spare pass, meets the slowed down EC2.
@@ -165,38 +168,45 @@ class EC2QueueMaintenanceLatencyTest {
     }
 
     /**
-     * Turns every EC2 call the counting and provisioning code uses into a five second call, so a
-     * blocking one is unmistakable in the measurements.
-     */
-    /**
-     * Turns every EC2 call the counting and provisioning code uses into a five second call, so a
-     * blocking one is unmistakable in the measurements.
+     * An EC2 client whose calls can be made to take five seconds each, so a blocking one is
+     * unmistakable in the measurements.
      *
-     * <p>Called from the setup, before anything is queued, and never again: the client has to be the
-     * one the cloud already holds, and stubbing a client another thread is calling is a race in
-     * Mockito itself. A call arriving from the hot spare checker between a {@code doAnswer} and its
-     * {@code when} leaves Mockito complaining about unfinished stubbing.
+     * <p>The delay is a switch rather than a later round of stubbing, because a mock cannot be
+     * stubbed once other threads can call it: {@code doAnswer(...).when(mock)} parks the answers in
+     * the mock's invocation container, and an agent launching or a hot spare pass calling the same
+     * client takes them instead of the stubbed method, which surfaces as Mockito complaining about
+     * unfinished stubbing. Here everything is stubbed before the client is published, and the tests
+     * only flip a boolean afterwards.
      */
-    private static void slowDownEveryEc2Call() {
-        Ec2Client inUse = AmazonEC2FactoryMockImpl.mock;
+    private static Ec2Client slowableEc2Client() {
+        Ec2Client real = AmazonEC2FactoryMockImpl.createAmazonEC2Mock();
+        Ec2Client slowable = Mockito.mock(Ec2Client.class, AdditionalAnswers.delegatesTo(real));
         Mockito.doAnswer(invocation -> {
-                    Thread.sleep(EC2_CALL_DELAY_MS);
-                    return DescribeInstancesResponse.builder().build();
+                    pauseIfSlowed();
+                    return real.describeInstances((DescribeInstancesRequest) invocation.getArgument(0));
                 })
-                .when(inUse)
+                .when(slowable)
                 .describeInstances(Mockito.any(DescribeInstancesRequest.class));
         Mockito.doAnswer(invocation -> {
-                    Thread.sleep(EC2_CALL_DELAY_MS);
-                    return DescribeSpotInstanceRequestsResponse.builder().build();
+                    pauseIfSlowed();
+                    return real.describeSpotInstanceRequests(
+                            (DescribeSpotInstanceRequestsRequest) invocation.getArgument(0));
                 })
-                .when(inUse)
+                .when(slowable)
                 .describeSpotInstanceRequests(Mockito.any(DescribeSpotInstanceRequestsRequest.class));
         Mockito.doAnswer(invocation -> {
-                    Thread.sleep(EC2_CALL_DELAY_MS);
-                    return RunInstancesResponse.builder().build();
+                    pauseIfSlowed();
+                    return real.runInstances((RunInstancesRequest) invocation.getArgument(0));
                 })
-                .when(inUse)
+                .when(slowable)
                 .runInstances(Mockito.any(RunInstancesRequest.class));
+        return slowable;
+    }
+
+    private static void pauseIfSlowed() throws InterruptedException {
+        if (SLOWED.get()) {
+            Thread.sleep(EC2_CALL_DELAY_MS);
+        }
     }
 
     private EC2Cloud cloud(HotSpareConfigByLabel rule, SlaveTemplate... templates) throws Exception {
