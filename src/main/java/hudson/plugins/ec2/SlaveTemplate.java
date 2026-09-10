@@ -80,6 +80,7 @@ import jenkins.slaves.iterators.api.NodeIterator;
 import jenkins.util.SystemProperties;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
@@ -246,6 +247,26 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
     private MinimumNumberOfInstancesTimeRangeConfig minimumNumberOfInstancesTimeRangeConfig;
 
     private final int minimumNumberOfSpareInstances;
+
+    /**
+     * Relative weight of this template when several templates match the same label and the cloud
+     * has {@link EC2Cloud#isRoundRobinTemplatesByLabel()} enabled. Boxed so a configuration saved
+     * before the field existed reads as unset and defaults to 1 rather than to 0, which would mean
+     * "exclude from rotation".
+     */
+    private Integer hotSpareWeight;
+
+    /**
+     * Minutes to wait for an agent to come online after provisioning was requested. 0 disables the
+     * grace period, which is the behaviour of configurations saved before it existed.
+     */
+    private int gracePeriodMinutes;
+
+    /**
+     * Whether an agent that is still offline when the grace period expires is discarded outright
+     * rather than handed to the idle-termination clock.
+     */
+    private boolean discardAfterGracePeriod = true;
 
     public final boolean stopOnTerminate;
 
@@ -1962,6 +1983,42 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
 
     public int getMinimumNumberOfSpareInstances() {
         return minimumNumberOfSpareInstances;
+    }
+
+    /**
+     * @return the relative weight of this template in the label rotation. Defaults to 1, giving
+     *     plain round-robin. 0 excludes the template unless every other template in the group is in
+     *     a capacity cooldown.
+     */
+    public int getHotSpareWeight() {
+        return hotSpareWeight == null ? 1 : Math.max(0, hotSpareWeight);
+    }
+
+    @DataBoundSetter
+    public void setHotSpareWeight(int hotSpareWeight) {
+        this.hotSpareWeight = Math.max(0, hotSpareWeight);
+    }
+
+    /**
+     * @return minutes an agent is given to come online before the grace period expires, or 0 when
+     *     no grace period is configured on this template.
+     */
+    public int getGracePeriodMinutes() {
+        return gracePeriodMinutes;
+    }
+
+    @DataBoundSetter
+    public void setGracePeriodMinutes(int gracePeriodMinutes) {
+        this.gracePeriodMinutes = Math.max(0, gracePeriodMinutes);
+    }
+
+    public boolean isDiscardAfterGracePeriod() {
+        return discardAfterGracePeriod;
+    }
+
+    @DataBoundSetter
+    public void setDiscardAfterGracePeriod(boolean discardAfterGracePeriod) {
+        this.discardAfterGracePeriod = discardAfterGracePeriod;
     }
 
     public MinimumNumberOfInstancesTimeRangeConfig getMinimumNumberOfInstancesTimeRangeConfig() {
@@ -3732,6 +3789,27 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
             } catch (NumberFormatException ignore) {
             }
             return FormValidation.error("Minimum number of spare instances must be a non-negative integer (or null)");
+        }
+
+        @POST
+        public FormValidation doCheckHotSpareWeight(@QueryParameter String value, @AncestorInPath EC2Cloud cloud) {
+            if (value == null || value.trim().isEmpty()) {
+                return FormValidation.ok();
+            }
+            int val;
+            try {
+                val = Integer.parseInt(value);
+            } catch (NumberFormatException ignore) {
+                return FormValidation.error("Hot spare weight must be a non-negative integer (or null)");
+            }
+            if (val < 0) {
+                return FormValidation.error("Hot spare weight must be a non-negative integer (or null)");
+            }
+            if (val != 1 && cloud != null && !cloud.isRoundRobinTemplatesByLabel()) {
+                return FormValidation.warning(
+                        "This weight is ignored until \"Round-robin templates matching the same label\" is enabled on the cloud.");
+            }
+            return FormValidation.ok();
         }
 
         @POST
