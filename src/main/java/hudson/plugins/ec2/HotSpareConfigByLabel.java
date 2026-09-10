@@ -269,6 +269,11 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
 
         @POST
         public FormValidation doCheckLabel(@QueryParameter String value) {
+            // As everywhere else in this plugin, someone who cannot configure the cloud gets no
+            // validation rather than an error, so viewing the configuration read-only still works.
+            if (!Jenkins.get().hasPermission(Jenkins.ADMINISTER)) {
+                return FormValidation.ok();
+            }
             String label = Util.fixEmptyAndTrim(value);
             if (label == null) {
                 return FormValidation.error("A label is required");
@@ -287,16 +292,25 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
 
         @POST
         public FormValidation doCheckScalingFactor(@QueryParameter String value) {
+            if (!Jenkins.get().hasPermission(Jenkins.ADMINISTER)) {
+                return FormValidation.ok();
+            }
             return nonNegative(value, "Hot spare step");
         }
 
         @POST
         public FormValidation doCheckBaseHotSpares(@QueryParameter String value) {
+            if (!Jenkins.get().hasPermission(Jenkins.ADMINISTER)) {
+                return FormValidation.ok();
+            }
             return nonNegative(value, "Base hot spares");
         }
 
         @POST
         public FormValidation doCheckMaxHotSpares(@QueryParameter String value, @QueryParameter String baseHotSpares) {
+            if (!Jenkins.get().hasPermission(Jenkins.ADMINISTER)) {
+                return FormValidation.ok();
+            }
             FormValidation nonNegative = nonNegative(value, "Maximum hot spares");
             if (nonNegative.kind != FormValidation.Kind.OK || Util.fixEmptyAndTrim(value) == null) {
                 return nonNegative;
@@ -316,11 +330,17 @@ public class HotSpareConfigByLabel extends AbstractDescribableImpl<HotSpareConfi
 
         @POST
         public FormValidation doCheckGracePeriodMinutes(@QueryParameter String value) {
+            if (!Jenkins.get().hasPermission(Jenkins.ADMINISTER)) {
+                return FormValidation.ok();
+            }
             return nonNegative(value, "Grace period");
         }
 
         @POST
         public FormValidation doCheckIdleTimeoutMinutes(@QueryParameter String value) {
+            if (!Jenkins.get().hasPermission(Jenkins.ADMINISTER)) {
+                return FormValidation.ok();
+            }
             if (Util.fixEmptyAndTrim(value) == null) {
                 return FormValidation.ok();
             }

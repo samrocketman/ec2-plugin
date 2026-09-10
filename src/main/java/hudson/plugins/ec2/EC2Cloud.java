@@ -1278,17 +1278,19 @@ public class EC2Cloud extends Cloud {
             return inFlightInstances.size();
         }
         return (int) inFlightInstances.values().stream()
-                .filter(inFlight -> templateKey.equals(inFlight.templateKey))
+                .filter(inFlight -> templateKey.equals(inFlight.templateId))
                 .count();
     }
 
     private static final class InFlightInstance {
 
-        private final String templateKey;
+        /** The description and AMI of the template that launched it, from {@link #templateCountKey}. */
+        private final String templateId;
+
         private final long launchedAtMillis;
 
-        InFlightInstance(String templateKey, long launchedAtMillis) {
-            this.templateKey = templateKey;
+        InFlightInstance(String templateId, long launchedAtMillis) {
+            this.templateId = templateId;
             this.launchedAtMillis = launchedAtMillis;
         }
     }

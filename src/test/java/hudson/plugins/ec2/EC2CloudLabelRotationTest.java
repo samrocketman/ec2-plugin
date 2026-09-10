@@ -9,8 +9,11 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.User;
 import hudson.plugins.ec2.util.AmazonEC2FactoryMockImpl;
 import hudson.plugins.ec2.util.SSHCredentialHelper;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import hudson.util.FormValidation;
 import java.security.Security;
 import java.util.ArrayList;
@@ -18,9 +21,11 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import jenkins.model.Jenkins;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import org.mockito.Mockito;
 import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
@@ -239,6 +244,27 @@ class EC2CloudLabelRotationTest {
 
         cloud.setRoundRobinTemplatesByLabel(true);
         assertThat(descriptor.doCheckHotSpareWeight("3", cloud).kind, equalTo(FormValidation.Kind.OK));
+    }
+
+    /**
+     * That warning reports how the cloud is configured, so the validation answers nothing at all to
+     * someone who may not configure it.
+     */
+    @Test
+    void testHotSpareWeightValidationTellsNonAdministratorsNothing() throws Exception {
+        SlaveTemplate template = template("first", FIRST_TYPE, 10);
+        EC2Cloud cloud = cloud(false, template);
+        SlaveTemplate.DescriptorImpl descriptor = r.jenkins.getDescriptorByType(SlaveTemplate.DescriptorImpl.class);
+        r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
+        r.jenkins.setAuthorizationStrategy(
+                new MockAuthorizationStrategy().grant(Jenkins.READ).everywhere().to("reader"));
+
+        try (ACLContext ignored = ACL.as2(User.getById("reader", true).impersonate2())) {
+            assertThat(
+                    "an administrator gets a warning here",
+                    descriptor.doCheckHotSpareWeight("3", cloud).kind,
+                    equalTo(FormValidation.Kind.OK));
+        }
     }
 
     /**

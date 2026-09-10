@@ -3793,6 +3793,11 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
 
         @POST
         public FormValidation doCheckHotSpareWeight(@QueryParameter String value, @AncestorInPath EC2Cloud cloud) {
+            // The warning below reports how the cloud is configured, so only someone who may
+            // configure it gets an answer.
+            if (!Jenkins.get().hasPermission(Jenkins.ADMINISTER)) {
+                return FormValidation.ok();
+            }
             if (value == null || value.trim().isEmpty()) {
                 return FormValidation.ok();
             }

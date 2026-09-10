@@ -9,16 +9,23 @@ import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import hudson.model.Node;
+import hudson.model.User;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import hudson.util.FormValidation;
 import java.util.Collections;
 import java.util.List;
+import jenkins.model.Jenkins;
 import org.htmlunit.html.HtmlPage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
+import org.springframework.security.access.AccessDeniedException;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
 
 /**
@@ -286,6 +293,40 @@ class HotSpareConfigByLabelTest {
         assertThat(descriptor.doCheckLabel("!windows").kind, equalTo(FormValidation.Kind.OK));
         assertThat(descriptor.doCheckLabel("  ").kind, equalTo(FormValidation.Kind.ERROR));
         assertThat(descriptor.doCheckLabel(LABEL + " &&").kind, equalTo(FormValidation.Kind.ERROR));
+    }
+
+    /**
+     * The form endpoints are reachable by anyone who can log in, so they answer only to someone who
+     * may configure the cloud. Validation goes quiet rather than failing, which is what keeps a
+     * read-only view of the configuration usable, and completion offers nothing.
+     */
+    @Test
+    void testTheFormEndpointsTellNonAdministratorsNothing() {
+        r.jenkins.clouds.add(cloud(null, template("30", 0)));
+        HotSpareConfigByLabel.DescriptorImpl descriptor =
+                r.jenkins.getDescriptorByType(HotSpareConfigByLabel.DescriptorImpl.class);
+        r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
+        r.jenkins.setAuthorizationStrategy(
+                new MockAuthorizationStrategy().grant(Jenkins.READ).everywhere().to("reader"));
+
+        try (ACLContext ignored = ACL.as2(User.getById("reader", true).impersonate2())) {
+            assertThat(descriptor.doCheckLabel(LABEL + " &&").kind, equalTo(FormValidation.Kind.OK));
+            assertThat(descriptor.doCheckScalingFactor("-1").kind, equalTo(FormValidation.Kind.OK));
+            assertThat(descriptor.doCheckBaseHotSpares("-1").kind, equalTo(FormValidation.Kind.OK));
+            assertThat(descriptor.doCheckMaxHotSpares("1", "5").kind, equalTo(FormValidation.Kind.OK));
+            assertThat(descriptor.doCheckGracePeriodMinutes("-1").kind, equalTo(FormValidation.Kind.OK));
+            assertThat(descriptor.doCheckIdleTimeoutMinutes("not a number").kind, equalTo(FormValidation.Kind.OK));
+            assertThrows(AccessDeniedException.class, () -> descriptor.doAutoCompleteLabel(""));
+        }
+
+        // The same values an administrator is told about, so the assertions above mean something.
+        assertThat(descriptor.doCheckLabel(LABEL + " &&").kind, equalTo(FormValidation.Kind.ERROR));
+        assertThat(descriptor.doCheckScalingFactor("-1").kind, equalTo(FormValidation.Kind.ERROR));
+        assertThat(descriptor.doCheckBaseHotSpares("-1").kind, equalTo(FormValidation.Kind.ERROR));
+        assertThat(descriptor.doCheckMaxHotSpares("1", "5").kind, equalTo(FormValidation.Kind.ERROR));
+        assertThat(descriptor.doCheckGracePeriodMinutes("-1").kind, equalTo(FormValidation.Kind.ERROR));
+        assertThat(descriptor.doCheckIdleTimeoutMinutes("not a number").kind, equalTo(FormValidation.Kind.ERROR));
+        assertThat(descriptor.doAutoCompleteLabel("").getValues(), hasItems(LABEL));
     }
 
     @Test
