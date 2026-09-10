@@ -155,15 +155,31 @@ public class MinimumInstanceChecker {
     }
 
     /**
-     * @return whether an agent is warm capacity the label can hand to the next build. An agent that
-     *     has drained its maximum number of uses is idle and online but stops accepting tasks, so
-     *     counting it would let a pool of agents that can never run anything satisfy the target.
+     * @return whether an agent is warm capacity the label can count on right now. An agent that has
+     *     drained its maximum number of uses is idle and online but stops accepting tasks, so
+     *     counting it would let a pool of agents that can never run anything satisfy the target. An
+     *     agent whose template is outside its schedule does not count either, so the label warms up
+     *     on a template that is on duty and lets this one go at its idle timeout.
      */
     private static boolean isSpare(@NonNull EC2Computer computer) {
+        SlaveTemplate template = computer.getSlaveTemplate();
         return computer.isIdle()
                 && computer.isOnline()
                 && computer.isAcceptingTasks()
-                && !computer.isTemporarilyOffline();
+                && !computer.isTemporarilyOffline()
+                && (template == null || keepsWarmInstancesNow(template));
+    }
+
+    /**
+     * @return whether a template may be holding instances nothing has asked for at this moment.
+     *     <i>Only apply minimum number of instances during specific time range</i> is how an admin
+     *     pays for warm capacity only when it is worth having, so a hot spare rule honours it
+     *     instead of quietly putting the template back on the clock around the clock. The schedule
+     *     stays a property of the template, which is what lets one label be served by a template
+     *     per shift.
+     */
+    public static boolean keepsWarmInstancesNow(@NonNull SlaveTemplate template) {
+        return minimumInstancesActive(template.getMinimumNumberOfInstancesTimeRangeConfig());
     }
 
     /**
@@ -335,7 +351,9 @@ public class MinimumInstanceChecker {
      *
      * <p>A rule owns the spare count for its label, so a template's
      * {@link SlaveTemplate#getMinimumNumberOfSpareInstances()} no longer applies to the templates
-     * the rule covers.
+     * the rule covers. A template's time range for keeping instances is another matter and is still
+     * obeyed: outside it the template holds no spares and the label warms up on whichever of its
+     * templates is on duty, so a label can be served by a template per shift.
      *
      * <p>Only idle agents count towards the target, so a spare taken by a build is a shortfall to be
      * replaced, which is what keeps a label warm for the whole of a busy period instead of draining
@@ -382,14 +400,22 @@ public class MinimumInstanceChecker {
 
     /**
      * Spreads a shortfall over the templates of a label group, in rotation order so hot spare
-     * weights apply, and never beyond what a template's instance cap allows. A template at its cap
-     * is skipped for this round and its share is offered to the templates that still have room.
+     * weights apply, and never beyond what a template's instance cap allows. A template at its cap,
+     * or outside the time range it is configured to hold instances in, is skipped for this round and
+     * its share is offered to the templates that can take it.
      */
     private static void provisionAcrossLabelGroup(
             @NonNull EC2Cloud cloud, @NonNull Label label, @NonNull Collection<SlaveTemplate> matching, int toLaunch) {
         for (SlaveTemplate template : cloud.orderTemplatesForLabel(label, matching)) {
             if (toLaunch <= 0) {
                 return;
+            }
+            if (!keepsWarmInstancesNow(template)) {
+                LOGGER.log(
+                        Level.FINE,
+                        "{0} is outside the time range it keeps instances in, offering its hot spares to the next template",
+                        template);
+                continue;
             }
             int headroom = cloud.getAvailableCapacity(template);
             if (headroom <= 0) {
@@ -406,7 +432,8 @@ public class MinimumInstanceChecker {
         if (toLaunch > 0) {
             LOGGER.log(
                     Level.FINE,
-                    "{0} hot spare(s) for label {1} were not provisioned: every template is at its instance cap",
+                    "{0} hot spare(s) for label {1} were not provisioned: every template is at its instance cap or "
+                            + "outside the time range it keeps instances in",
                     new Object[] {toLaunch, label.getName()});
         }
     }

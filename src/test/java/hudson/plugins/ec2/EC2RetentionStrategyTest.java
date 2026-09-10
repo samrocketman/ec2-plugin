@@ -109,6 +109,7 @@ class EC2RetentionStrategyTest {
     @org.junit.jupiter.api.AfterEach
     void tearDown() {
         EC2RetentionStrategy.HEAVY_WORK_EXECUTOR = originalExecutor;
+        MinimumInstanceChecker.clock = Clock.systemDefaultZone();
     }
 
     @Test
@@ -984,6 +985,53 @@ class EC2RetentionStrategyTest {
                 .check(computerWithUpTime(20, 0, false, false, readyAt.toEpochMilli()));
 
         assertThat("the surplus spare should have been reclaimed", idleTimeoutCalled.get(), equalTo(true));
+    }
+
+    /**
+     * A template that only keeps instances during a time range stops being warm capacity outside
+     * it, whatever the label's target says. Otherwise a rule would hold the agent around the clock
+     * and undo the schedule the admin configured to avoid paying for it.
+     */
+    @Test
+    void testAnIdleSpareIsReclaimedOnceItsTemplateScheduleCloses() throws Exception {
+        final int RETENTION_MINUTES = 5;
+        HotSpareConfigByLabel rule = new HotSpareConfigByLabel("ttt");
+        rule.setScalingFactor(5);
+        rule.setIdleTimeoutMinutes(RETENTION_MINUTES);
+        EC2Cloud cloud =
+                new EC2Cloud("cloud", true, "abc", "us-east-1", null, "ghi", "20", Collections.emptyList(), null, null);
+        cloud.setHotSpareConfigsByLabel(List.of(rule));
+        r.jenkins.clouds.add(cloud);
+        HotSpareDemand.reset();
+        assertThat(
+                "the label wants spares", HotSpareDemand.of(cloud, "ttt").updateTarget(rule, 0, 0, 5, 0), equalTo(5));
+
+        MinimumNumberOfInstancesTimeRangeConfig window = new MinimumNumberOfInstancesTimeRangeConfig();
+        window.setMinimumNoInstancesActiveTimeRangeFrom("11:00");
+        window.setMinimumNoInstancesActiveTimeRangeTo("15:00");
+        window.setTuesday(true);
+        SlaveTemplate template = templateWithIdleTermination(null);
+        template.setMinimumNumberOfInstancesTimeRangeConfig(window);
+        // Tuesday evening: the template is past the hours it keeps instances for.
+        LocalDateTime outsideTheWindow = LocalDateTime.of(2019, Month.SEPTEMBER, 24, 18, 0);
+        MinimumInstanceChecker.clock =
+                Clock.fixed(outsideTheWindow.atZone(ZoneId.systemDefault()).toInstant(), ZoneId.systemDefault());
+
+        final int BOOT_MINUTES = 5;
+        final Instant readyAt = Instant.now().plus(Duration.ofMinutes(BOOT_MINUTES));
+        final Instant checkTime = Instant.now().plus(Duration.ofMinutes(BOOT_MINUTES + RETENTION_MINUTES + 1));
+
+        new EC2RetentionStrategy(
+                        String.format("%d", RETENTION_MINUTES),
+                        Clock.fixed(checkTime.plusSeconds(1), zoneId),
+                        checkTime.toEpochMilli())
+                .check(computerWithUpTime(
+                        20, 0, false, false, readyAt.toEpochMilli(), 0L, Integer.MAX_VALUE, template));
+
+        assertThat(
+                "the spare should have been reclaimed once its template went off schedule",
+                idleTimeoutCalled.get(),
+                equalTo(true));
     }
 
     /**

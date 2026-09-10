@@ -31,6 +31,11 @@
     still provisions its floor per AMI. Each AMI's <i>Instance Cap</i> and the cloud-wide cap remain
     hard limits that a rule can only stay under.</p>
 
+    <p>An AMI configured with <i>Only apply minimum number of instances during specific time
+    range</i> holds spares only inside that range, and releases the ones it is holding at their idle
+    termination time when the range closes. The label keeps its spares on whichever of its AMIs is
+    on duty, so one AMI per shift adds up to a single pool that follows the schedule.</p>
+
     <p>A rule can also own the idle termination time and grace period of the agents for its label,
     so a label behaves consistently across instance types; see the settings under <i>Advanced</i> on
     each rule.</p>

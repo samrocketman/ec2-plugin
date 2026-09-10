@@ -27,6 +27,8 @@ import hudson.slaves.NodeProvisioner;
 import java.security.Security;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.Month;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -95,6 +97,7 @@ class LabelHotSpareCheckerTest {
     @AfterEach
     void tearDown() {
         HotSpareDemand.clock = Clock.systemDefaultZone();
+        MinimumInstanceChecker.clock = Clock.systemDefaultZone();
         HotSpareDemand.reset();
     }
 
@@ -126,6 +129,63 @@ class LabelHotSpareCheckerTest {
         MinimumInstanceChecker.checkForMinimumInstances();
 
         assertThat(countAgents(), equalTo(2));
+    }
+
+    /**
+     * A template only allowed to hold minimum instances during a time range must not be warmed
+     * outside it. Its schedule is how an admin pays for capacity only when it is wanted, and a
+     * label rule that ignored it would quietly put the template back on the clock 24x7.
+     */
+    @Test
+    void testATemplateOutsideItsScheduleHoldsNoSpares() throws Exception {
+        HotSpareConfigByLabel rule = rule(2, 0, null);
+        SlaveTemplate template = template("only", 10);
+        template.setMinimumNumberOfInstancesTimeRangeConfig(window("11:00", "15:00"));
+        cloud(rule, template);
+        atLocalTime(18, 0);
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(countAgents(), equalTo(0));
+    }
+
+    /**
+     * Inside the window the same rule provisions as usual, so the schedule gates the spares rather
+     * than disabling them.
+     */
+    @Test
+    void testATemplateInsideItsScheduleHoldsItsSpares() throws Exception {
+        HotSpareConfigByLabel rule = rule(2, 0, null);
+        SlaveTemplate template = template("only", 10);
+        template.setMinimumNumberOfInstancesTimeRangeConfig(window("11:00", "15:00"));
+        cloud(rule, template);
+        atLocalTime(12, 0);
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(countAgents(), equalTo(2));
+    }
+
+    /**
+     * The schedule belongs to the template, not to the label, so a label served by several
+     * templates keeps its spares on whichever of them is on duty. This is the arrangement the
+     * feature is meant to replace - a template per shift, offset so one is always awake - working
+     * as a single pool.
+     */
+    @Test
+    void testSparesMoveToTheTemplateWhoseScheduleIsOpen() throws Exception {
+        HotSpareConfigByLabel rule = rule(2, 0, null);
+        SlaveTemplate dayShift = template("day", 10);
+        dayShift.setMinimumNumberOfInstancesTimeRangeConfig(window("08:00", "18:00"));
+        SlaveTemplate nightShift = template("night", 10);
+        nightShift.setMinimumNumberOfInstancesTimeRangeConfig(window("18:00", "08:00"));
+        cloud(rule, dayShift, nightShift);
+        atLocalTime(22, 0);
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(countAgents(), equalTo(2));
+        assertThat(agentsByTemplate(), equalTo(Map.of("night", 2L)));
     }
 
     /**
@@ -336,6 +396,31 @@ class LabelHotSpareCheckerTest {
         for (Node node : new ArrayList<>(r.jenkins.getNodes())) {
             r.jenkins.removeNode(node);
         }
+    }
+
+    /**
+     * A window on every day of the week, so only the time of day decides whether the template is
+     * allowed to be holding instances.
+     */
+    private static MinimumNumberOfInstancesTimeRangeConfig window(String from, String to) {
+        MinimumNumberOfInstancesTimeRangeConfig window = new MinimumNumberOfInstancesTimeRangeConfig();
+        window.setMinimumNoInstancesActiveTimeRangeFrom(from);
+        window.setMinimumNoInstancesActiveTimeRangeTo(to);
+        window.setMonday(true);
+        window.setTuesday(true);
+        window.setWednesday(true);
+        window.setThursday(true);
+        window.setFriday(true);
+        window.setSaturday(true);
+        window.setSunday(true);
+        return window;
+    }
+
+    /** Fixes the wall clock the schedules are read against. */
+    private static void atLocalTime(int hour, int minute) {
+        LocalDateTime when = LocalDateTime.of(2019, Month.SEPTEMBER, 24, hour, minute); // A Tuesday
+        MinimumInstanceChecker.clock =
+                Clock.fixed(when.atZone(ZoneId.systemDefault()).toInstant(), ZoneId.systemDefault());
     }
 
     private static HotSpareConfigByLabel rule(int baseHotSpares, int scalingFactor, Integer maxHotSpares) {

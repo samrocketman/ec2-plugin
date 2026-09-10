@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import org.mockito.Mockito;
+import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.DescribeInstancesRequest;
 import software.amazon.awssdk.services.ec2.model.DescribeInstancesResponse;
 import software.amazon.awssdk.services.ec2.model.DescribeSpotInstanceRequestsRequest;
@@ -63,8 +64,12 @@ class EC2QueueMaintenanceLatencyTest {
         rule2.setGracePeriodMinutes(5);
         cloud = cloud(rule2, template("first", InstanceType.T2_MICRO), template("second", InstanceType.M1_LARGE));
 
-        // An agent and a queued build, so maintenance has something to think about.
+        // An agent, provisioned while EC2 is still quick to answer.
         cloud.provision(cloud.getTemplates().get(0), 1);
+        slowDownEveryEc2Call();
+
+        // A queued build, so maintenance has something to think about. Everything the queue sets
+        // off from here on, including a hot spare pass, meets the slowed down EC2.
         FreeStyleProject project = r.createFreeStyleProject();
         project.setAssignedLabel(Label.get(LABEL));
         project.scheduleBuild2(0);
@@ -72,8 +77,6 @@ class EC2QueueMaintenanceLatencyTest {
 
     @Test
     void testQueueMaintenanceDoesNotWaitOnEc2() {
-        slowDownEveryEc2Call();
-
         for (int pass = 0; pass < 3; pass++) {
             long elapsed = timed(() -> Jenkins.get().getQueue().maintain());
             assertThat(
@@ -90,8 +93,6 @@ class EC2QueueMaintenanceLatencyTest {
     @Test
     void testRetentionStrategyCheckDoesNotWaitOnEc2() {
         EC2Computer computer = anEc2Computer();
-        slowDownEveryEc2Call();
-
         long elapsed = timed(() -> new EC2RetentionStrategy("1").check(computer));
 
         assertThat(
@@ -106,8 +107,6 @@ class EC2QueueMaintenanceLatencyTest {
      */
     @Test
     void testSchedulingAHotSpareCheckDoesNotWaitOnEc2() {
-        slowDownEveryEc2Call();
-
         long elapsed = timed(MinimumInstanceChecker::scheduleCheck);
 
         assertThat(
@@ -121,8 +120,6 @@ class EC2QueueMaintenanceLatencyTest {
      */
     @Test
     void testCanProvisionDoesNotWaitOnEc2() {
-        slowDownEveryEc2Call();
-
         long elapsed = timed(() -> cloud.canProvision(Label.get(LABEL)));
 
         assertThat(
@@ -137,8 +134,6 @@ class EC2QueueMaintenanceLatencyTest {
      */
     @Test
     void testTheSlowedDownEc2CallsAreReachableAtAll() {
-        slowDownEveryEc2Call();
-
         long elapsed = timed(() -> {
             try {
                 cloud.provision(cloud.getTemplates().get(0), 1);
@@ -173,24 +168,34 @@ class EC2QueueMaintenanceLatencyTest {
      * Turns every EC2 call the counting and provisioning code uses into a five second call, so a
      * blocking one is unmistakable in the measurements.
      */
+    /**
+     * Turns every EC2 call the counting and provisioning code uses into a five second call, so a
+     * blocking one is unmistakable in the measurements.
+     *
+     * <p>Called from the setup, before anything is queued, and never again: the client has to be the
+     * one the cloud already holds, and stubbing a client another thread is calling is a race in
+     * Mockito itself. A call arriving from the hot spare checker between a {@code doAnswer} and its
+     * {@code when} leaves Mockito complaining about unfinished stubbing.
+     */
     private static void slowDownEveryEc2Call() {
+        Ec2Client inUse = AmazonEC2FactoryMockImpl.mock;
         Mockito.doAnswer(invocation -> {
                     Thread.sleep(EC2_CALL_DELAY_MS);
                     return DescribeInstancesResponse.builder().build();
                 })
-                .when(AmazonEC2FactoryMockImpl.mock)
+                .when(inUse)
                 .describeInstances(Mockito.any(DescribeInstancesRequest.class));
         Mockito.doAnswer(invocation -> {
                     Thread.sleep(EC2_CALL_DELAY_MS);
                     return DescribeSpotInstanceRequestsResponse.builder().build();
                 })
-                .when(AmazonEC2FactoryMockImpl.mock)
+                .when(inUse)
                 .describeSpotInstanceRequests(Mockito.any(DescribeSpotInstanceRequestsRequest.class));
         Mockito.doAnswer(invocation -> {
                     Thread.sleep(EC2_CALL_DELAY_MS);
                     return RunInstancesResponse.builder().build();
                 })
-                .when(AmazonEC2FactoryMockImpl.mock)
+                .when(inUse)
                 .runInstances(Mockito.any(RunInstancesRequest.class));
     }
 

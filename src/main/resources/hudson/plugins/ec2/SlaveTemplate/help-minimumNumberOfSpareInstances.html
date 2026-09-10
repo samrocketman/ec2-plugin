@@ -16,5 +16,6 @@
 
    <p>This setting is ignored while a cloud-level <i>Hot spares by label</i> rule matches one of the
     labels of this AMI, because such a rule owns the spare count for its whole label group. The
-    minimum number of instances above is unaffected.</p>
+    minimum number of instances above is unaffected, and so is its time range: a rule holds no
+    spares on this AMI outside the hours it is configured to keep instances in.</p>
 </div>
