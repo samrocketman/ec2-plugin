@@ -1,4 +1,9 @@
 <div>
+    <p><b>When to enable this option?</b> When the templates of a cloud are weighted by cost, with
+    the least expensive option carrying the highest weight. The highest weight is always
+    prioritized, so the least expensive provisioning is always prioritized, and a more expensive
+    template is only reached once the cheaper ones cannot supply an instance.</p>
+
     <p>Changes what a template's <i>Hot spare weight</i> means when several AMI configurations in
     this cloud match the same label. Requires <i>Round-robin templates matching the same label</i>
     to be enabled; without it, templates are tried in configured order and weights are ignored.</p>
