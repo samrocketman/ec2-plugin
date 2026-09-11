@@ -7,6 +7,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -72,7 +73,7 @@ class HotSpareDemandTest {
 
         assertThat("nothing is asking for the label yet", demand.updateTarget(config, 0, 0, 0, 0), equalTo(0));
 
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
     }
 
@@ -85,13 +86,13 @@ class HotSpareDemandTest {
     void testEveryExecutorTakenLeavesTheLabelAShortfallToReplace() {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
 
         // Five spares are warm, and builds start taking them one at a time.
         for (int taken = 1; taken <= 4; taken++) {
             clock.advanceSeconds(10);
-            HotSpareDemand.spareConsumed(cloud, config);
+            HotSpareDemand.spareConsumed(cloud, LABEL);
             int sparesLeft = 5 - taken;
             assertThat(
                     "the target covers the spares taken, so each one is replaced",
@@ -108,15 +109,15 @@ class HotSpareDemandTest {
     void testRunningTheSparesDryGrowsTheTarget() {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
 
         clock.advanceMinutes(1);
-        consume(config, 5);
+        consume(5);
         assertThat("nothing warm is left, so hold more of it", demand.updateTarget(config, 0, 5, 0, 6), equalTo(10));
 
         clock.advanceMinutes(1);
-        consume(config, 5);
+        consume(5);
         assertThat(demand.updateTarget(config, 0, 10, 0, 11), equalTo(15));
     }
 
@@ -129,12 +130,12 @@ class HotSpareDemandTest {
     void testOneBuildCannotClimbBeyondAStepOfHeadroom() {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
 
         for (int minute = 0; minute < 10; minute++) {
             clock.advanceMinutes(1);
-            HotSpareDemand.spareConsumed(cloud, config);
+            HotSpareDemand.spareConsumed(cloud, LABEL);
             demand.updateTarget(config, 0, 5, 0, 1);
         }
 
@@ -149,12 +150,12 @@ class HotSpareDemandTest {
     void testConcurrentBuildsGrowTheTargetOnlyAsFarAsTheirOwnNumberPlusAStep() {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
 
         for (int minute = 0; minute < 10; minute++) {
             clock.advanceMinutes(1);
-            consume(config, 5);
+            consume(5);
             demand.updateTarget(config, 0, 5, 0, 5);
         }
 
@@ -169,14 +170,14 @@ class HotSpareDemandTest {
     void testSparesBeingTakenWithWarmOnesLeftHoldsTheTarget() {
         HotSpareConfigByLabel config = rule(0, 5, null);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
 
         clock.advanceMinutes(5);
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 4, 1, 0, 2), equalTo(5));
         clock.advanceMinutes(5);
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 4, 1, 0, 3), equalTo(5));
     }
 
@@ -188,7 +189,7 @@ class HotSpareDemandTest {
         HotSpareConfigByLabel config = rule(0, 5, null);
         config.setIdleTimeoutMinutes(15);
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
-        HotSpareDemand.spareConsumed(cloud, config);
+        HotSpareDemand.spareConsumed(cloud, LABEL);
         assertThat(demand.updateTarget(config, 0, 0, 0, 1), equalTo(5));
 
         // The last build finishes. Nothing has taken an executor since.
@@ -237,16 +238,16 @@ class HotSpareDemandTest {
         HotSpareDemand demand = HotSpareDemand.of(cloud, LABEL);
 
         // Five builds running, and every spare that appears is taken straight away.
-        consume(config, 5);
+        consume(5);
         assertThat(demand.updateTarget(config, 0, 0, 0, 5), equalTo(5));
 
         clock.advanceMinutes(1);
-        consume(config, 5);
+        consume(5);
         assertThat(
                 "a step of cover above the five it is running", demand.updateTarget(config, 0, 5, 0, 5), equalTo(10));
 
         clock.advanceMinutes(1);
-        consume(config, 5);
+        consume(5);
         assertThat("and no further while the load stands still", demand.updateTarget(config, 0, 10, 0, 5), equalTo(10));
     }
 
@@ -463,9 +464,45 @@ class HotSpareDemandTest {
         assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(10));
     }
 
-    private void consume(HotSpareConfigByLabel config, int spares) {
+    /**
+     * The count an admin asked to always be held belongs to the rule, so a label the rule covers
+     * without naming starts from nothing. Charging the floor to each covered label would multiply
+     * it by however many labels there are.
+     */
+    @Test
+    void testALabelTheRuleOnlyCoversDoesNotClaimTheFloor() {
+        HotSpareConfigByLabel config = rule(3, 5, null);
+
+        assertThat(
+                "the label the rule names holds the floor",
+                HotSpareDemand.of(cloud, LABEL).updateTarget(config, 0, 0, 0, 0),
+                equalTo(3));
+        assertThat(
+                "a label it only covers starts from nothing",
+                HotSpareDemand.of(cloud, "covered").updateTarget(config, 0, 0, 0, 0, 0),
+                equalTo(0));
+    }
+
+    /**
+     * Targets are keyed by the label a job asked for, so a controller would otherwise end up
+     * holding an entry for every label it has ever seen. A label that has faded to nothing and was
+     * not looked at is dropped; one still holding spares is kept whether or not it was.
+     */
+    @Test
+    void testFadedLabelsAreForgottenAndLiveOnesAreKept() {
+        HotSpareConfigByLabel config = rule(0, 5, null);
+        HotSpareDemand.of(cloud, LABEL).updateTarget(config, 0, 0, 5, 0);
+        HotSpareDemand.of(cloud, "gone").updateTarget(config, 0, 0, 0, 0, 0);
+        HotSpareDemand.of(cloud, "quiet").updateTarget(config, 0, 0, 0, 0, 0);
+
+        HotSpareDemand.forgetZeroed(cloud, Set.of("quiet"));
+
+        assertThat(HotSpareDemand.trackedLabels(cloud), equalTo(Set.of(LABEL, "quiet")));
+    }
+
+    private void consume(int spares) {
         for (int i = 0; i < spares; i++) {
-            HotSpareDemand.spareConsumed(cloud, config);
+            HotSpareDemand.spareConsumed(cloud, LABEL);
         }
     }
 

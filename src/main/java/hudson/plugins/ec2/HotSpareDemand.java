@@ -26,17 +26,24 @@ package hudson.plugins.ec2;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.time.Clock;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
  * How many idle spares a label should be holding right now, learned from how well the spares have
  * been keeping up.
+ *
+ * <p>A target belongs to the label work asked for rather than to the rule that set the policy. Two
+ * labels covered by one rule scale apart: a burst of x86 builds cannot warm arm64 hardware that
+ * could never run them, even though one rule governs both.
  *
  * <p>A fixed number of spares is either wasted while nothing is building or exhausted the moment a
  * burst arrives, so the number is treated as a load prediction that follows demand:
@@ -103,10 +110,54 @@ public final class HotSpareDemand {
     /** Spares taken by builds since the last pass, counted by {@link #spareConsumed}. */
     private int consumedSinceLastPass;
 
-    private HotSpareDemand() {}
+    /** The label this target belongs to, for the logs. */
+    private final String label;
+
+    private HotSpareDemand(String label) {
+        this.label = label;
+    }
 
     public static HotSpareDemand of(@NonNull EC2Cloud cloud, @NonNull String label) {
-        return DEMANDS.computeIfAbsent(cloud.name + '\u0000' + label, key -> new HotSpareDemand());
+        return DEMANDS.computeIfAbsent(key(cloud, label), key -> new HotSpareDemand(label));
+    }
+
+    /**
+     * @return the labels of a cloud that hold a target, so a label whose work has gone away is
+     *     still visited by the next pass and fades a step at a time instead of dropping to nothing
+     *     the moment its queue empties.
+     */
+    public static Set<String> trackedLabels(@NonNull EC2Cloud cloud) {
+        String prefix = cloud.name + '\u0000';
+        return DEMANDS.keySet().stream()
+                .filter(key -> key.startsWith(prefix))
+                .map(key -> key.substring(prefix.length()))
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
+    /**
+     * Drops the targets of a cloud that have faded to nothing, so a controller does not hold an
+     * entry for every label a job has ever asked for. A label that comes back is simply learned
+     * again from the work that asks for it.
+     *
+     * <p>A target above zero is kept: spares are being held for it, and it has to fade a step at a
+     * time rather than vanish. So is one with a spare taken since the last pass, which is a label
+     * about to want something even though its target has not caught up yet.
+     *
+     * @param keep labels to hold on to whatever their target, for the labels the rules name: they
+     *     are a fixed set, and their targets are where a rule's floor lives.
+     */
+    public static void forgetZeroed(@NonNull EC2Cloud cloud, @NonNull Set<String> keep) {
+        String prefix = cloud.name + '\u0000';
+        DEMANDS.entrySet().removeIf(entry -> {
+            String key = entry.getKey();
+            if (!key.startsWith(prefix) || keep.contains(key.substring(prefix.length()))) {
+                return false;
+            }
+            HotSpareDemand demand = entry.getValue();
+            synchronized (demand) {
+                return demand.target <= 0 && demand.consumedSinceLastPass == 0;
+            }
+        });
     }
 
     /**
@@ -115,6 +166,10 @@ public final class HotSpareDemand {
      */
     public static void reset() {
         DEMANDS.clear();
+    }
+
+    private static String key(@NonNull EC2Cloud cloud, @NonNull String label) {
+        return cloud.name + '\u0000' + label;
     }
 
     /**
@@ -130,7 +185,19 @@ public final class HotSpareDemand {
      */
     public synchronized int updateTarget(
             @NonNull HotSpareConfigByLabel config, int spares, int provisioning, int queued, int busy) {
-        final int base = config.getBaseHotSpares();
+        return updateTarget(config, config.getBaseHotSpares(), spares, provisioning, queued, busy);
+    }
+
+    /**
+     * The same, for a label the rule governs without naming. The count an admin asked to always be
+     * held belongs to the rule as a whole, so it is charged to the label the rule names and the
+     * labels underneath it start from nothing; charging it to each of them would multiply it by
+     * however many labels the rule happens to cover.
+     *
+     * @param base the floor this label's target may not fall below.
+     */
+    public synchronized int updateTarget(
+            @NonNull HotSpareConfigByLabel config, int base, int spares, int provisioning, int queued, int busy) {
         final int step = growthStep(config);
         final long now = clock.millis();
         final int consumed = consumedSinceLastPass;
@@ -186,7 +253,11 @@ public final class HotSpareDemand {
                     overshotSinceMillis = now;
                 } else if (now - overshotSinceMillis >= decayIntervalMillis(config)) {
                     overshotSinceMillis = now;
-                    stepDownTo(config, wanted, "the label has held less work than the target for a whole idle timeout");
+                    stepDownTo(
+                            config,
+                            base,
+                            wanted,
+                            "the label has held less work than the target for a whole idle timeout");
                 }
             } else {
                 overshotSinceMillis = 0;
@@ -197,8 +268,7 @@ public final class HotSpareDemand {
                 overshotSinceMillis = 0;
             } else if (now - quietSinceMillis >= decayIntervalMillis(config)) {
                 quietSinceMillis = now;
-                stepDownTo(
-                        config, config.getBaseHotSpares(), "nothing has asked for the label for a whole idle timeout");
+                stepDownTo(config, base, base, "nothing has asked for the label for a whole idle timeout");
             }
         }
 
@@ -213,7 +283,7 @@ public final class HotSpareDemand {
                     Level.FINE,
                     "Raising the hot spare target for {0} from {1} to {2} ({3} taken since the last pass, "
                             + "{4} still warm, {5} queued)",
-                    new Object[] {config.getLabel(), target, raised, consumed, spares, queued});
+                    new Object[] {label, target, raised, consumed, spares, queued});
             target = raised;
         }
     }
@@ -222,16 +292,16 @@ public final class HotSpareDemand {
      * Reports that a build has taken an executor on an agent of this label, which is both the
      * signal that the label is in use and the moment its pool of spares got one smaller.
      *
+     * <p>The label is the one the build asked for, not the one of the rule that governs it: a build
+     * that wanted {@code x86_64} says nothing about how warm the arm64 pool should be, even when
+     * one rule covers both.
+     *
      * <p>Callers follow this with {@link hudson.plugins.ec2.util.MinimumInstanceChecker#scheduleCheck()}
      * so the replacement is on its way while the build that took the spare is still starting, which
      * is the point of the whole feature: the next build finds somewhere warm to land instead of
      * waiting for an instance to boot.
      */
-    public static void spareConsumed(@NonNull EC2Cloud cloud, @NonNull HotSpareConfigByLabel config) {
-        String label = config.getLabel();
-        if (label == null) {
-            return;
-        }
+    public static void spareConsumed(@NonNull EC2Cloud cloud, @NonNull String label) {
         HotSpareDemand demand = of(cloud, label);
         synchronized (demand) {
             demand.consumedSinceLastPass++;
@@ -248,11 +318,11 @@ public final class HotSpareDemand {
      * higher. The target is what decides how many spares a label keeps, so nothing terminates an
      * agent until this has come down past it.
      */
-    private void stepDownTo(HotSpareConfigByLabel config, int floor, String why) {
-        int lowered = Math.max(Math.max(config.getBaseHotSpares(), floor), target - growthStep(config));
+    private void stepDownTo(HotSpareConfigByLabel config, int base, int floor, String why) {
+        int lowered = Math.max(Math.max(base, floor), target - growthStep(config));
         if (lowered != target) {
             LOGGER.log(Level.FINE, "Lowering the hot spare target for {0} from {1} to {2}: {3}", new Object[] {
-                config.getLabel(), target, lowered, why
+                label, target, lowered, why
             });
             target = lowered;
         }

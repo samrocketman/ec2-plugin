@@ -388,18 +388,15 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
         if (cloud == null) {
             return false;
         }
-        SlaveTemplate template = templateOf(computer);
-        if (template == null) {
+        if (templateOf(computer) == null) {
             return false;
         }
-        for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
-            if (config.matches(template) && MinimumInstanceChecker.isSpareStillWanted(cloud, config, computer)) {
-                LOGGER.log(
-                        Level.FINE,
-                        "Keeping {0} past its idle timeout: the hot spares for {1} are still counting on it",
-                        new Object[] {computer.getName(), config.getLabel()});
-                return true;
-            }
+        if (MinimumInstanceChecker.isSpareStillWanted(cloud, computer)) {
+            LOGGER.log(
+                    Level.FINE,
+                    "Keeping {0} past its idle timeout: the hot spares of a label it serves are still counting on it",
+                    computer.getName());
+            return true;
         }
         return false;
     }
@@ -412,25 +409,22 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
      * {@link MinimumInstanceChecker#scheduleCheck()} because this runs on the executor thread, which
      * is no place to wait on EC2.
      */
-    private static void noteConsumedSpare(EC2Computer computer) {
+    private static void noteConsumedSpare(EC2Computer computer, Queue.Task task) {
         EC2Cloud cloud = cloudOf(computer);
         if (cloud == null) {
             return;
         }
-        SlaveTemplate template = templateOf(computer);
-        if (template == null) {
+        /*
+         * The pool that just lost a spare is the one the build asked for, not every pool the agent
+         * belongs to: a build that wanted x86 hardware is no reason to keep arm64 agents warm, even
+         * where one rule covers both labels.
+         */
+        Label assigned = task == null ? null : task.getAssignedLabel();
+        if (assigned == null || cloud.getHotSpareConfigForLabel(assigned) == null) {
             return;
         }
-        boolean matched = false;
-        for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
-            if (config.matches(template)) {
-                HotSpareDemand.spareConsumed(cloud, config);
-                matched = true;
-            }
-        }
-        if (matched) {
-            MinimumInstanceChecker.scheduleCheck();
-        }
+        HotSpareDemand.spareConsumed(cloud, assigned.getName());
+        MinimumInstanceChecker.scheduleCheck();
     }
 
     /**
@@ -606,7 +600,7 @@ public class EC2RetentionStrategy extends RetentionStrategy<EC2Computer> impleme
     public void taskAccepted(Executor executor, Queue.Task task) {
         EC2Computer computer = (EC2Computer) executor.getOwner();
         if (computer != null) {
-            noteConsumedSpare(computer);
+            noteConsumedSpare(computer, task);
             EC2AbstractSlave slaveNode = computer.getNode();
             if (slaveNode != null) {
                 int maxTotalUses = slaveNode.maxTotalUses;

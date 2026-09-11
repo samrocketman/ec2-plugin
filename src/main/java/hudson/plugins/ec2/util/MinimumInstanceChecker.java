@@ -1,11 +1,14 @@
 package hudson.plugins.ec2.util;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.init.Terminator;
 import hudson.model.Computer;
+import hudson.model.Executor;
 import hudson.model.Label;
 import hudson.model.Queue;
+import hudson.model.queue.WorkUnit;
 import hudson.plugins.ec2.EC2AbstractSlave;
 import hudson.plugins.ec2.EC2Cloud;
 import hudson.plugins.ec2.EC2Computer;
@@ -19,7 +22,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -130,12 +136,10 @@ public class MinimumInstanceChecker {
     }
 
     /**
-     * Agents of a whole label group. A hot spare rule owns the label rather than one AMI, so its
-     * counts aggregate over every template of the cloud carrying that label instead of matching a
-     * single template description.
+     * Agents of a cloud, whichever of its templates they came from.
      */
-    private static Stream<EC2Computer> agentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
-        Set<String> descriptions = cloud.getTemplates(label).stream()
+    private static Stream<EC2Computer> agentsOf(@NonNull EC2Cloud cloud) {
+        Set<String> descriptions = cloud.getTemplates().stream()
                 .map(template -> template.description)
                 .filter(Objects::nonNull)
                 .collect(Collectors.toSet());
@@ -146,6 +150,22 @@ public class MinimumInstanceChecker {
                     SlaveTemplate computerTemplate = computer.getSlaveTemplate();
                     return computerTemplate != null && descriptions.contains(computerTemplate.description);
                 });
+    }
+
+    /**
+     * Agents that could serve a label: a hot spare target is held by the label work asked for, and
+     * any template of the cloud carrying that label can hold it, not just the one an earlier agent
+     * happened to come from.
+     */
+    private static Stream<EC2Computer> agentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
+        Set<String> descriptions = cloud.getTemplates(label).stream()
+                .map(template -> template.description)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        return agentsOf(cloud).filter(computer -> {
+            SlaveTemplate computerTemplate = computer.getSlaveTemplate();
+            return computerTemplate != null && descriptions.contains(computerTemplate.description);
+        });
     }
 
     public static int countCurrentNumberOfSpareAgentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
@@ -196,22 +216,34 @@ public class MinimumInstanceChecker {
      * <p>The agent being asked about is included whether or not the counted set has caught up with
      * it, because the comparison is meaningless if the pool it is ranked against excludes it.
      *
-     * @return true when the label wants this agent kept warm, false when it is surplus, is not warm
-     *     capacity at all, or the label wants no spares.
+     * <p>An agent can serve several labels, each with a target of its own, so the question is asked
+     * of every label it could take work for: it is surplus only once none of them is counting on
+     * it.
+     *
+     * @return true when some label wants this agent kept warm, false when it is surplus to all of
+     *     them or is not warm capacity at all.
      */
-    public static boolean isSpareStillWanted(
-            @NonNull EC2Cloud cloud, @NonNull HotSpareConfigByLabel config, @NonNull EC2Computer computer) {
-        String labelName = config.getLabel();
-        if (labelName == null || labelName.isBlank()) {
+    public static boolean isSpareStillWanted(@NonNull EC2Cloud cloud, @NonNull EC2Computer computer) {
+        if (!isSpare(computer)) {
+            return false;
+        }
+        return HotSpareDemand.trackedLabels(cloud).stream()
+                .anyMatch(labelName -> isSpareStillWantedFor(cloud, labelName, computer));
+    }
+
+    private static boolean isSpareStillWantedFor(
+            @NonNull EC2Cloud cloud, @NonNull String labelName, @NonNull EC2Computer computer) {
+        if (labelName.isBlank()) {
             return false;
         }
         int target = HotSpareDemand.of(cloud, labelName).getTarget();
-        if (target <= 0 || !isSpare(computer)) {
+        if (target <= 0) {
             return false;
         }
 
         Label label = Label.get(labelName);
-        if (label == null) {
+        SlaveTemplate template = computer.getSlaveTemplate();
+        if (label == null || template == null || !label.matches(template.getLabelSet())) {
             return false;
         }
 
@@ -245,24 +277,28 @@ public class MinimumInstanceChecker {
     }
 
     /**
-     * @return the number of agents of the label group running a build. They are not spares, which
-     *     is why a spare taken by a build is replaced, but they do say the label is in use.
+     * @return the number of agents running a build that asked for this label. They are not spares,
+     *     which is why a spare taken by a build is replaced, but they do say the label is in use.
+     *     <p>What the build asked for is the measure, not what the agent happens to be able to run:
+     *     an agent serving a branch build on a template that also carries the pull request label
+     *     says nothing about how much pull request capacity to keep warm.
      */
-    public static int countCurrentNumberOfBusyAgentsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
+    public static int countAgentsRunningWorkFor(@NonNull EC2Cloud cloud, @NonNull Label label) {
         return (int) agentsForLabel(cloud, label)
                 .filter(computer -> !computer.isIdle())
+                .filter(computer ->
+                        computer.getExecutors().stream().anyMatch(executor -> isAssignedTo(executor, label)))
                 .count();
     }
 
     /**
-     * @return the number of buildable queue items any template of the label group could serve.
+     * @return the number of buildable queue items waiting for exactly this label. An item waiting
+     *     for a different label is another label's demand, even when one template could serve both.
      */
-    public static int countQueueItemsForLabel(@NonNull EC2Cloud cloud, @NonNull Label label) {
-        Collection<SlaveTemplate> templates = cloud.getTemplates(label);
+    public static int countQueueItemsRequesting(@NonNull Label label) {
         return (int) Queue.getInstance().getBuildableItems().stream()
                 .map((Queue.Item item) -> item.getAssignedLabel())
-                .filter(Objects::nonNull)
-                .filter(assigned -> templates.stream().anyMatch(template -> assigned.matches(template.getLabelSet())))
+                .filter(assigned -> isSameLabel(label, assigned))
                 .count();
     }
 
@@ -350,9 +386,15 @@ public class MinimumInstanceChecker {
     }
 
     /**
-     * Tops up the hot spares for every label rule of a cloud. Runs inside
+     * Tops up the hot spares of a cloud, one label at a time. Runs inside
      * {@link #checkForMinimumInstances()} rather than from a monitor of its own so all provisioning
      * decisions stay behind the same lock (JENKINS-76171).
+     *
+     * <p>A rule sets the policy; the label a job asked for is what scales. A rule covering
+     * {@code x86_64_medium || arm64_medium} says how both should behave, but each keeps a target of
+     * its own, so a run of x86 builds warms x86 hardware and leaves the arm64 pool cold. Only the
+     * count an admin asked to be held at all times belongs to the rule as a whole, and it is held
+     * by the label the rule names.
      *
      * <p>A rule owns the spare count for its label, so a template's
      * {@link SlaveTemplate#getMinimumNumberOfSpareInstances()} no longer applies to the templates
@@ -370,11 +412,11 @@ public class MinimumInstanceChecker {
      * should be.
      */
     private static void checkForLabelHotSpares(@NonNull EC2Cloud cloud) {
-        for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
-            String labelName = config.getLabel();
-            if (labelName == null) {
-                continue;
-            }
+        Map<String, HotSpareConfigByLabel> tracked = trackedLabels(cloud);
+        Set<String> namedByRules = new LinkedHashSet<>();
+        for (Map.Entry<String, HotSpareConfigByLabel> entry : tracked.entrySet()) {
+            String labelName = entry.getKey();
+            HotSpareConfigByLabel config = entry.getValue();
             Label label = Label.get(labelName);
             if (label == null) {
                 continue;
@@ -386,11 +428,18 @@ public class MinimumInstanceChecker {
 
             int currentSpares = countCurrentNumberOfSpareAgentsForLabel(cloud, label);
             int currentProvisioning = countCurrentNumberOfProvisioningAgentsForLabel(cloud, label);
-            int busyAgents = countCurrentNumberOfBusyAgentsForLabel(cloud, label);
-            int queuedBuilds = countQueueItemsForLabel(cloud, label);
+            int busyAgents = countAgentsRunningWorkFor(cloud, label);
+            int queuedBuilds = countQueueItemsRequesting(label);
+            // The rule's floor is held by the label the rule names, so the labels it covers scale
+            // from nothing rather than each claiming a floor of their own.
+            boolean namedByRule = labelName.equals(config.getLabel());
+            int base = namedByRule ? config.getBaseHotSpares() : 0;
+            if (namedByRule) {
+                namedByRules.add(labelName);
+            }
 
             int target = HotSpareDemand.of(cloud, labelName)
-                    .updateTarget(config, currentSpares, currentProvisioning, queuedBuilds, busyAgents);
+                    .updateTarget(config, base, currentSpares, currentProvisioning, queuedBuilds, busyAgents);
             int toLaunch = target - (currentSpares + currentProvisioning);
 
             LOGGER.log(
@@ -404,6 +453,84 @@ public class MinimumInstanceChecker {
                 provisionAcrossLabelGroup(cloud, label, matching, toLaunch);
             }
         }
+        HotSpareDemand.forgetZeroed(cloud, namedByRules);
+    }
+
+    /**
+     * The labels of a cloud that have a hot spare target this pass, each with the rule that governs
+     * it. A label is tracked because a rule names it, because work is waiting for it, because work
+     * is running on it, or because it still holds a target from earlier and has to fade rather than
+     * drop.
+     *
+     * <p>A label a rule only covers is governed by the first rule in configuration order that
+     * covers a template able to serve it, which is the same order the rest of the plugin resolves a
+     * label's settings in.
+     *
+     * <p>Insertion ordered so a pass is reproducible, with the labels the rules name first: those
+     * carry the floors, and holding them first means the labels underneath find them already warm.
+     */
+    private static Map<String, HotSpareConfigByLabel> trackedLabels(@NonNull EC2Cloud cloud) {
+        Map<String, HotSpareConfigByLabel> tracked = new LinkedHashMap<>();
+        for (HotSpareConfigByLabel config : cloud.getHotSpareConfigsByLabel()) {
+            String labelName = config.getLabel();
+            if (labelName != null && !labelName.isBlank()) {
+                tracked.putIfAbsent(labelName, config);
+            }
+        }
+        Stream.of(
+                        HotSpareDemand.trackedLabels(cloud).stream(),
+                        Queue.getInstance().getBuildableItems().stream()
+                                .map(Queue.Item::getAssignedLabel)
+                                .filter(Objects::nonNull)
+                                .map(Label::getName),
+                        labelsOfRunningWork(cloud))
+                .flatMap(labels -> labels)
+                .distinct()
+                .filter(labelName -> !tracked.containsKey(labelName))
+                .forEach(labelName -> {
+                    Label label = Label.get(labelName);
+                    HotSpareConfigByLabel governing = label == null ? null : cloud.getHotSpareConfigForLabel(label);
+                    if (governing != null) {
+                        tracked.put(labelName, governing);
+                    }
+                });
+        return tracked;
+    }
+
+    /**
+     * @return the labels the builds running on this cloud's agents asked for. Work already running
+     *     is part of how busy a label is, so its label keeps a prediction alive even once the queue
+     *     has drained.
+     */
+    private static Stream<String> labelsOfRunningWork(@NonNull EC2Cloud cloud) {
+        return agentsOf(cloud)
+                .flatMap(computer -> computer.getExecutors().stream())
+                .map(MinimumInstanceChecker::assignedLabelOf)
+                .filter(Objects::nonNull)
+                .map(Label::getName);
+    }
+
+    /**
+     * @return the label the work on an executor asked for, or {@code null} if the executor is free
+     *     or its work carries no label. Work with no label of its own raises no target: it could
+     *     have run anywhere, so it says nothing about which hardware to keep warm.
+     */
+    @CheckForNull
+    private static Label assignedLabelOf(@NonNull Executor executor) {
+        WorkUnit workUnit = executor.getCurrentWorkUnit();
+        return workUnit == null || workUnit.work == null ? null : workUnit.work.getAssignedLabel();
+    }
+
+    private static boolean isAssignedTo(@NonNull Executor executor, @NonNull Label label) {
+        return isSameLabel(label, assignedLabelOf(executor));
+    }
+
+    /**
+     * Labels are compared by name because that is what a target is keyed by, so an expression is
+     * the same demand however it reached the checker.
+     */
+    private static boolean isSameLabel(@NonNull Label label, @CheckForNull Label other) {
+        return other != null && label.getName().equals(other.getName());
     }
 
     /**

@@ -3,6 +3,7 @@ package hudson.plugins.ec2.util;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.notNullValue;
 
 import hudson.ExtensionList;
@@ -35,6 +36,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import jenkins.model.Jenkins;
@@ -225,13 +227,13 @@ class LabelHotSpareCheckerTest {
     }
 
     /**
-     * Work in sight is counted through the templates of the group, so a build asking for one label
-     * of a shared template is demand for every rule covering it. The labels are not independent
-     * signals when they are the same machines.
+     * Work in sight belongs to the label that asked for it. A build wanting one label of a shared
+     * template says nothing about the other, even though the same machines serve both: what the
+     * build asked for is the only evidence of what it would have accepted.
      */
     @Test
-    void testWorkForOneLabelIsWorkInSightForEveryRuleCoveringTheTemplate() throws Exception {
-        EC2Cloud cloud = cloud(List.of(rule("bar", 0), rule("foo", 0)), template("shared", 10, "foo bar"));
+    void testWorkForOneLabelIsNotWorkInSightForAnother() throws Exception {
+        cloud(List.of(rule("bar", 0), rule("foo", 0)), template("shared", 10, "foo bar"));
 
         r.jenkins.setQuietPeriod(0);
         FreeStyleProject project = r.createFreeStyleProject();
@@ -240,11 +242,150 @@ class LabelHotSpareCheckerTest {
         Queue.getInstance().maintain();
         waitForABuildableItem();
 
-        assertThat(MinimumInstanceChecker.countQueueItemsForLabel(cloud, Label.get("bar")), equalTo(1));
+        assertThat(MinimumInstanceChecker.countQueueItemsRequesting(Label.get("bar")), equalTo(1));
         assertThat(
-                "a build asking for bar is work in sight for foo as well",
-                MinimumInstanceChecker.countQueueItemsForLabel(cloud, Label.get("foo")),
-                equalTo(1));
+                "a build asking for bar is not work in sight for foo",
+                MinimumInstanceChecker.countQueueItemsRequesting(Label.get("foo")),
+                equalTo(0));
+    }
+
+    /**
+     * The reported defect: a rule covering both architectures had a run of x86 pull request builds
+     * warming arm64 instances that none of those builds could ever have used. A rule says how the
+     * labels it covers should behave; it does not make them one pool.
+     */
+    @Test
+    void testABuildForOneLabelDoesNotWarmTheOtherHardwareOfTheRule() throws Exception {
+        EC2Cloud cloud = cloud(
+                rule("x86_64_medium_pr || arm64_medium_pr", 0, 5),
+                template("x86", 10, "x86_64_medium_pr"),
+                template("arm", 10, "arm64_medium_pr"));
+
+        queueBuildFor("x86_64_medium_pr");
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(agentsByTemplate(), equalTo(Map.of("x86", 5L)));
+        assertThat(
+                "arm64 was never asked for",
+                HotSpareDemand.of(cloud, "arm64_medium_pr").getTarget(),
+                equalTo(0));
+    }
+
+    /**
+     * The same, for the label that made the defect visible in practice: a rule grouping small
+     * agents with the generator label used to have generator builds warm both architectures of
+     * small agent.
+     */
+    @Test
+    void testALabelSharingARuleWithOthersScalesOnItsOwn() throws Exception {
+        EC2Cloud cloud = cloud(
+                rule("x86_64_small || arm64_small || jervis_generator", 0, 2),
+                template("x86", 10, "x86_64_small jervis_generator"),
+                template("arm", 10, "arm64_small"));
+
+        queueBuildFor("jervis_generator");
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(agentsByTemplate(), equalTo(Map.of("x86", 2L)));
+        assertThat(HotSpareDemand.of(cloud, "jervis_generator").getTarget(), equalTo(2));
+        assertThat(HotSpareDemand.of(cloud, "arm64_small").getTarget(), equalTo(0));
+    }
+
+    /**
+     * Labels scaling apart is not the same as their spares being separate machines. Where one
+     * template serves both labels, a warm agent counts for both of them, so two labels wanting two
+     * spares each are served by two agents rather than four.
+     */
+    @Test
+    void testLabelsServedByOneTemplateShareItsSpares() throws Exception {
+        EC2Cloud cloud = cloud(rule("foo || bar", 0, 2), template("shared", 10, "foo bar"));
+
+        queueBuildFor("foo");
+        queueBuildFor("bar");
+        MinimumInstanceChecker.checkForMinimumInstances();
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat("one set of spares, serving both labels", countAgents(), equalTo(2));
+        assertThat(HotSpareDemand.of(cloud, "foo").getTarget(), equalTo(2));
+        assertThat(HotSpareDemand.of(cloud, "bar").getTarget(), equalTo(2));
+    }
+
+    /**
+     * A job asking for a compound expression is a label in its own right: the rule covering the
+     * templates that carry both atoms governs it, and it is warmed separately from either atom on
+     * its own.
+     */
+    @Test
+    void testACompoundExpressionIsTrackedUnderTheRuleThatCoversIt() throws Exception {
+        EC2Cloud cloud =
+                cloud(rule("foo || bar", 0, 2), template("both", 10, "foo bar"), template("foo-only", 10, "foo"));
+
+        queueBuildFor("foo && bar");
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(
+                "only the template carrying both labels can serve it", agentsByTemplate(), equalTo(Map.of("both", 2L)));
+        assertThat(HotSpareDemand.of(cloud, "foo&&bar").getTarget(), equalTo(2));
+        assertThat(
+                "the atoms are separate demand", HotSpareDemand.of(cloud, "foo").getTarget(), equalTo(0));
+    }
+
+    /**
+     * A build takes a spare on an agent that serves several labels, and only the label it asked for
+     * is short of one. The others were not using that agent.
+     */
+    @Test
+    void testTakingAnExecutorOnlyWarmsTheLabelTheBuildAskedFor() throws Exception {
+        SlaveTemplate template = template("shared", 20, "foo bar");
+        EC2Cloud cloud = cloud(rule("foo || bar", 0, 2), template);
+
+        cloud.provision(template, 1);
+        EC2Computer computer = onlyAgent();
+        retentionStrategyOf(computer).taskAccepted(new Executor(computer, 0), taskAskingFor("foo"));
+
+        waitForAtLeastAgents(2);
+        assertThat(HotSpareDemand.of(cloud, "foo").getTarget(), equalTo(2));
+        assertThat(HotSpareDemand.of(cloud, "bar").getTarget(), equalTo(0));
+    }
+
+    /**
+     * The count an admin asked to always be held belongs to the rule, not to each label it covers,
+     * so a rule over four labels with a floor of two holds two agents rather than eight.
+     */
+    @Test
+    void testTheFloorIsHeldOncePerRuleRatherThanPerLabel() throws Exception {
+        cloud(rule("foo || bar", 2, 0), template("first", 10, "foo"), template("second", 10, "bar"));
+
+        MinimumInstanceChecker.checkForMinimumInstances();
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(countAgents(), equalTo(2));
+    }
+
+    /**
+     * Targets are keyed by whatever label a job asked for, so a controller would otherwise
+     * accumulate one for every label it has ever seen. A label that has faded to nothing is
+     * forgotten; the labels the rules name stay, because that is where the floors live.
+     */
+    @Test
+    void testALabelThatHasFadedToNothingIsForgotten() throws Exception {
+        HotSpareConfigByLabel rule = rule("foo || bar", 0, 2);
+        rule.setIdleTimeoutMinutes(15);
+        EC2Cloud cloud = cloud(rule, template("shared", 10, "foo bar"));
+
+        queueBuildFor("foo");
+        MinimumInstanceChecker.checkForMinimumInstances();
+        assertThat(HotSpareDemand.trackedLabels(cloud), hasItem("foo"));
+
+        cancelAllQueuedBuilds();
+        removeAllAgents();
+        // One pass to see the label go quiet, and one an idle timeout later to fade it to nothing.
+        clock.advanceMinutes(16);
+        MinimumInstanceChecker.checkForMinimumInstances();
+        clock.advanceMinutes(16);
+        MinimumInstanceChecker.checkForMinimumInstances();
+
+        assertThat(HotSpareDemand.trackedLabels(cloud), equalTo(Set.of("foo || bar")));
     }
 
     /**
@@ -387,7 +528,7 @@ class LabelHotSpareCheckerTest {
         cloud.provision(template, 1);
         EC2Computer computer = onlyAgent();
         int launchedBefore = AmazonEC2FactoryMockImpl.instances.size();
-        retentionStrategyOf(computer).taskAccepted(new Executor(computer, 0), null);
+        retentionStrategyOf(computer).taskAccepted(new Executor(computer, 0), taskAskingFor(LABEL));
 
         /*
          * Nothing else has happened: no queued build, no periodic pass, and the clock has not moved.
@@ -407,15 +548,37 @@ class LabelHotSpareCheckerTest {
      * with more agents than that, because the agents running those builds are not spares.
      */
     private static void waitForABuildableItem() throws Exception {
+        waitForBuildableItems(1);
+    }
+
+    private static void waitForBuildableItems(int expected) throws Exception {
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
-        while (Queue.getInstance().getBuildableItems().isEmpty() && System.currentTimeMillis() < deadline) {
+        while (Queue.getInstance().getBuildableItems().size() < expected && System.currentTimeMillis() < deadline) {
             Thread.sleep(50);
             Queue.getInstance().maintain();
         }
         assertThat(
                 "the build should have reached the queue by now",
                 Queue.getInstance().getBuildableItems().size(),
-                greaterThanOrEqualTo(1));
+                greaterThanOrEqualTo(expected));
+    }
+
+    /** Queues a build that will only run on the given label, and waits for it to be buildable. */
+    private void queueBuildFor(String label) throws Exception {
+        r.jenkins.setQuietPeriod(0);
+        int queuedBefore = Queue.getInstance().getBuildableItems().size();
+        FreeStyleProject project = r.createFreeStyleProject();
+        project.setAssignedLabel(Label.get(label));
+        project.scheduleBuild2(0);
+        Queue.getInstance().maintain();
+        waitForBuildableItems(queuedBefore + 1);
+    }
+
+    private static void cancelAllQueuedBuilds() {
+        for (Queue.Item item : Queue.getInstance().getItems()) {
+            Queue.getInstance().cancel(item);
+        }
+        Queue.getInstance().maintain();
     }
 
     private static void waitForAtLeastAgents(int expected) throws Exception {
@@ -432,6 +595,13 @@ class LabelHotSpareCheckerTest {
                 .map(EC2Computer.class::cast)
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("no EC2 agent was provisioned"));
+    }
+
+    /** A build that would only run on the given label, for the paths that read what it asked for. */
+    private Queue.Task taskAskingFor(String label) throws Exception {
+        FreeStyleProject project = r.createFreeStyleProject();
+        project.setAssignedLabel(Label.get(label));
+        return project;
     }
 
     private static EC2RetentionStrategy retentionStrategyOf(EC2Computer computer) {
@@ -496,9 +666,13 @@ class LabelHotSpareCheckerTest {
 
     /** A rule for another label, with a fixed count and no scaling of its own. */
     private static HotSpareConfigByLabel rule(String label, int baseHotSpares) {
+        return rule(label, baseHotSpares, 0);
+    }
+
+    private static HotSpareConfigByLabel rule(String label, int baseHotSpares, int scalingFactor) {
         HotSpareConfigByLabel rule = new HotSpareConfigByLabel(label);
         rule.setBaseHotSpares(baseHotSpares);
-        rule.setScalingFactor(0);
+        rule.setScalingFactor(scalingFactor);
         return rule;
     }
 

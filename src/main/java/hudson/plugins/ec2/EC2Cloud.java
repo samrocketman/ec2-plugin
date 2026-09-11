@@ -516,6 +516,22 @@ public class EC2Cloud extends Cloud {
     }
 
     /**
+     * @return the hot spare rule whose policy governs a label, or {@code null} if none does. A rule
+     *     governs a label when it covers a template that can serve it, which is what lets one rule
+     *     set the policy for several labels while each of them scales on its own.
+     */
+    @CheckForNull
+    public HotSpareConfigByLabel getHotSpareConfigForLabel(@NonNull Label label) {
+        Collection<SlaveTemplate> serving = getTemplates(label);
+        for (HotSpareConfigByLabel config : getHotSpareConfigsByLabel()) {
+            if (serving.stream().anyMatch(config::matches)) {
+                return config;
+            }
+        }
+        return null;
+    }
+
+    /**
      * @return the idle timeout configured for a label, or {@code null} if no rule covers it.
      */
     @CheckForNull
