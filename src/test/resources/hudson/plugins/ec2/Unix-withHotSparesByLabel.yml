@@ -6,6 +6,7 @@ jenkins:
         useInstanceProfileForCredentials: true
         sshKeysCredentialsId: "random credentials id"
         roundRobinTemplatesByLabel: true
+        saturateHighestWeightFirst: true
         hotSpareConfigsByLabel:
           - label: "linux"
             baseHotSpares: 2

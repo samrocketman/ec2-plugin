@@ -1988,7 +1988,8 @@ public class SlaveTemplate implements Describable<SlaveTemplate> {
     /**
      * @return the relative weight of this template in the label rotation. Defaults to 1, giving
      *     plain round-robin. 0 excludes the template unless every other template in the group is in
-     *     a capacity cooldown.
+     *     a capacity cooldown. A weight is a share of the requests, or a rank when the cloud has
+     *     {@link EC2Cloud#isSaturateHighestWeightFirst()} enabled.
      */
     public int getHotSpareWeight() {
         return hotSpareWeight == null ? 1 : Math.max(0, hotSpareWeight);

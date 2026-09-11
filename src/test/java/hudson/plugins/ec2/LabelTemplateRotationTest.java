@@ -24,8 +24,10 @@ class LabelTemplateRotationTest {
 
     private boolean enabled = true;
 
+    private boolean saturateHighestWeightFirst = false;
+
     private LabelTemplateRotation rotation() {
-        return new LabelTemplateRotation(() -> enabled);
+        return new LabelTemplateRotation(() -> enabled, () -> saturateHighestWeightFirst);
     }
 
     /**
@@ -56,8 +58,9 @@ class LabelTemplateRotationTest {
     }
 
     /**
-     * Weights 3 and 1 pick the heavier template three times as often, and the picks interleave
-     * instead of bursting, which is what makes the fallback to the lighter template fast.
+     * By default a weight is a share of the requests: weights 3 and 1 pick the heavier template
+     * three times as often, and the picks interleave instead of bursting, which is what makes the
+     * fallback to the lighter template fast.
      */
     @Test
     void testWeightedRotationInterleavesPicks() {
@@ -71,6 +74,82 @@ class LabelTemplateRotationTest {
                 "the heavier template should lead six of eight requests",
                 heads.stream().filter("spot"::equals).count(),
                 equalTo(6L));
+    }
+
+    /**
+     * Saturating the highest weight first turns the same weights into a ranking: the heavier
+     * template leads every request rather than three out of four, and the lighter one stays behind
+     * it as the fallback for the request.
+     */
+    @Test
+    void testSaturatingHighestWeightKeepsTheHeaviestLeading() {
+        saturateHighestWeightFirst = true;
+        LabelTemplateRotation rotation = rotation();
+        List<SlaveTemplate> group = List.of(template("spot", 3), template("ondemand", 1));
+
+        for (int i = 0; i < 8; i++) {
+            assertThat(descriptions(rotation.order(LABEL, group)), contains("spot", "ondemand"));
+        }
+    }
+
+    /**
+     * Templates sharing a weight are one band and still take turns, so a label spreads over the
+     * instance types an admin considers equivalent instead of concentrating on the first one.
+     */
+    @Test
+    void testSaturatingHighestWeightRotatesWithinABand() {
+        saturateHighestWeightFirst = true;
+        LabelTemplateRotation rotation = rotation();
+        List<SlaveTemplate> group = List.of(template("spot a", 3), template("spot b", 3), template("ondemand", 1));
+
+        assertThat(descriptions(rotation.order(LABEL, group)), contains("spot a", "spot b", "ondemand"));
+        assertThat(descriptions(rotation.order(LABEL, group)), contains("spot b", "spot a", "ondemand"));
+        assertThat(descriptions(rotation.order(LABEL, group)), contains("spot a", "spot b", "ondemand"));
+    }
+
+    /**
+     * Bands are ordered by weight rather than by configuration, so the fallback within a request
+     * always walks down the ranking.
+     */
+    @Test
+    void testSaturatingHighestWeightOrdersEveryBandByWeight() {
+        saturateHighestWeightFirst = true;
+        LabelTemplateRotation rotation = rotation();
+        List<SlaveTemplate> group = List.of(template("light", 1), template("heavy", 5), template("middle", 3));
+
+        assertThat(descriptions(rotation.order(LABEL, group)), contains("heavy", "middle", "light"));
+    }
+
+    /**
+     * The next band down leads only once every template above it is cooling down, which is what
+     * makes an exhausted instance type hand the label over rather than share it.
+     */
+    @Test
+    void testSaturatingHighestWeightFallsToTheNextBandOnceTheTopIsCoolingDown() {
+        saturateHighestWeightFirst = true;
+        LabelTemplateRotation rotation = rotation();
+        SlaveTemplate spotA = template("spot a", 3);
+        SlaveTemplate spotB = template("spot b", 3);
+        SlaveTemplate onDemand = template("ondemand", 1);
+        List<SlaveTemplate> group = List.of(spotA, spotB, onDemand);
+
+        rotation.markTemplateUnavailable(spotA, group.size());
+        assertThat(descriptions(rotation.order(LABEL, group)), contains("spot b", "ondemand", "spot a"));
+
+        rotation.markTemplateUnavailable(spotB, group.size());
+        assertThat(descriptions(rotation.order(LABEL, group)), contains("ondemand", "spot a", "spot b"));
+    }
+
+    /**
+     * A weight of zero remains a last resort under the ranking as well.
+     */
+    @Test
+    void testSaturatingHighestWeightKeepsZeroWeightLast() {
+        saturateHighestWeightFirst = true;
+        LabelTemplateRotation rotation = rotation();
+        List<SlaveTemplate> group = List.of(template("lastResort", 0), template("preferred", 1));
+
+        assertThat(descriptions(rotation.order(LABEL, group)), contains("preferred", "lastResort"));
     }
 
     /**

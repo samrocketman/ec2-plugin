@@ -10,6 +10,11 @@
     spot three times as often, while still falling back to on-demand immediately if spot capacity
     is unavailable.</p>
 
+    <p>If the cloud has <i>Saturate the highest weight before using a lower one</i> enabled, the
+    weight is a rank instead of a share: the same example attempts spot for every request, and the
+    on-demand template is only used once spot is at its instance cap or has been demoted for
+    reporting insufficient capacity. Templates sharing a weight still take turns.</p>
+
     <p>The default of 1 gives plain round-robin. A weight of 0 excludes the template from normal
     rotation; it is only used when every other template in the group is in a capacity cooldown.</p>
 

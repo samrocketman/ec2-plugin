@@ -254,6 +254,7 @@ class ConfigurationAsCodeTest {
         final EC2Cloud ec2Cloud = (EC2Cloud) Jenkins.get().getCloud("hotSpares");
         assertNotNull(ec2Cloud);
         assertTrue(ec2Cloud.isRoundRobinTemplatesByLabel());
+        assertTrue(ec2Cloud.isSaturateHighestWeightFirst());
 
         final List<HotSpareConfigByLabel> rules = ec2Cloud.getHotSpareConfigsByLabel();
         assertEquals(1, rules.size());
@@ -292,6 +293,7 @@ class ConfigurationAsCodeTest {
         final EC2Cloud ec2Cloud = (EC2Cloud) Jenkins.get().getCloud("staging");
         assertNotNull(ec2Cloud);
         assertFalse(ec2Cloud.isRoundRobinTemplatesByLabel());
+        assertFalse(ec2Cloud.isSaturateHighestWeightFirst());
         assertTrue(ec2Cloud.getHotSpareConfigsByLabel().isEmpty());
 
         final SlaveTemplate slaveTemplate = ec2Cloud.getTemplates().get(0);

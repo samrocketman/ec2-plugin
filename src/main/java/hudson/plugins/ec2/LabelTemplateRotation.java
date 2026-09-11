@@ -27,8 +27,11 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
@@ -49,7 +52,13 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * <p>Selection is smooth weighted round-robin (as used by nginx) over
  * {@link SlaveTemplate#getHotSpareWeight()}: for weights 2 and 1 the leading template alternates as
  * {@code a, a, b, a, a, b} rather than picking {@code a} twice in a row and then {@code b} twice,
- * which is what makes the fallback fast when one instance type runs dry.
+ * which is what makes the fallback fast when one instance type runs dry. A weight is therefore a
+ * share of the attempts, and every weight keeps getting some of them.
+ *
+ * <p>{@link EC2Cloud#isSaturateHighestWeightFirst()} swaps that for a hierarchy: templates sharing
+ * a weight form a band, the highest band leads every request, and a lower band is only reached once
+ * every template above it is at its instance cap or in the capacity cooldown. Templates within a
+ * band still rotate, so a band spreads over its instance types and availability zones.
  *
  * <p>All of this is inert unless {@link EC2Cloud#isRoundRobinTemplatesByLabel()} is enabled.
  */
@@ -82,15 +91,21 @@ class LabelTemplateRotation {
     /** Plain rotation cursor per label, used when every candidate has a weight of zero. */
     private final ConcurrentHashMap<String, Integer> unweightedCursor = new ConcurrentHashMap<>();
 
+    /** Rotation cursor per label and weight, used within a band when saturating the highest first. */
+    private final ConcurrentHashMap<String, Integer> bandCursor = new ConcurrentHashMap<>();
+
     /** Template key to the epoch-millis timestamp until which the template should be demoted. */
     private final ConcurrentHashMap<String, Long> templateCapacityCooldownUntil = new ConcurrentHashMap<>();
 
     private final BooleanSupplier enabled;
 
+    private final BooleanSupplier saturateHighestWeightFirst;
+
     private Clock clock;
 
-    LabelTemplateRotation(@NonNull BooleanSupplier enabled) {
+    LabelTemplateRotation(@NonNull BooleanSupplier enabled, @NonNull BooleanSupplier saturateHighestWeightFirst) {
         this.enabled = enabled;
+        this.saturateHighestWeightFirst = saturateHighestWeightFirst;
     }
 
     /**
@@ -100,8 +115,9 @@ class LabelTemplateRotation {
      *
      * @param labelName the label being provisioned for, or an empty string for no label
      * @param matching the templates matching that label, in configured order
-     * @return the templates to try, best first. The configured order is returned unchanged when
-     *     rotation is disabled or only one template matches.
+     * @return the templates to try, best first, by share of the weights or by weight band
+     *     depending on {@link EC2Cloud#isSaturateHighestWeightFirst()}. The configured order is
+     *     returned unchanged when rotation is disabled or only one template matches.
      */
     List<SlaveTemplate> order(String labelName, Collection<SlaveTemplate> matching) {
         List<SlaveTemplate> candidates = new ArrayList<>(matching);
@@ -121,15 +137,56 @@ class LabelTemplateRotation {
 
         // Every template is cooling down: rotate over all of them rather than refuse to provision.
         List<SlaveTemplate> pool = available.isEmpty() ? candidates : available;
-        SlaveTemplate head = selectWeighted(labelName, pool);
-
-        List<SlaveTemplate> ordered = new ArrayList<>(candidates.size());
-        int headIndex = pool.indexOf(head);
-        for (int i = 0; i < pool.size(); i++) {
-            ordered.add(pool.get((headIndex + i) % pool.size()));
-        }
+        List<SlaveTemplate> ordered = saturateHighestWeightFirst.getAsBoolean()
+                ? orderByWeightBand(labelName, pool)
+                : rotateAround(pool, selectWeighted(labelName, pool));
         if (pool != candidates) {
             ordered.addAll(coolingDown);
+        }
+        return ordered;
+    }
+
+    /**
+     * Orders the pool into weight bands, heaviest first, so a lighter band is only reached once
+     * every template above it has turned the request down. Cooling-down templates are already out
+     * of the pool, which is what lets a fully saturated band hand the label to the next one.
+     *
+     * <p>The heaviest band is rotated so its templates take turns leading, spreading a label over
+     * the instance types and availability zones the admin considers equivalent. Lighter bands keep
+     * their configured order: they are a fallback within this request, and they rotate in their own
+     * right once they are the heaviest band still available.
+     */
+    private List<SlaveTemplate> orderByWeightBand(String labelName, List<SlaveTemplate> pool) {
+        NavigableMap<Integer, List<SlaveTemplate>> bands = new TreeMap<>(Comparator.reverseOrder());
+        for (SlaveTemplate t : pool) {
+            bands.computeIfAbsent(t.getHotSpareWeight(), weight -> new ArrayList<>())
+                    .add(t);
+        }
+
+        List<SlaveTemplate> ordered = new ArrayList<>(pool.size());
+        boolean leading = true;
+        for (Map.Entry<Integer, List<SlaveTemplate>> band : bands.entrySet()) {
+            List<SlaveTemplate> members = band.getValue();
+            if (leading && members.size() > 1) {
+                int cursor = bandCursor.merge(key(labelName) + "/" + band.getKey(), 1, Integer::sum) - 1;
+                ordered.addAll(rotateAround(members, members.get(Math.floorMod(cursor, members.size()))));
+            } else {
+                ordered.addAll(members);
+            }
+            leading = false;
+        }
+        return ordered;
+    }
+
+    /**
+     * @return {@code pool} rotated so {@code head} leads and the templates configured before it
+     *     wrap around to the end.
+     */
+    private static List<SlaveTemplate> rotateAround(List<SlaveTemplate> pool, SlaveTemplate head) {
+        List<SlaveTemplate> ordered = new ArrayList<>(pool.size());
+        int headIndex = Math.max(0, pool.indexOf(head));
+        for (int i = 0; i < pool.size(); i++) {
+            ordered.add(pool.get((headIndex + i) % pool.size()));
         }
         return ordered;
     }

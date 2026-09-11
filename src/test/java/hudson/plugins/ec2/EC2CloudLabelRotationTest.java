@@ -91,6 +91,51 @@ class EC2CloudLabelRotationTest {
     }
 
     /**
+     * Saturating the highest weight first sends every request to the heavier template. Under the
+     * default proportional rotation the lighter one would have led the third of these four
+     * requests.
+     */
+    @Test
+    void testSaturatingHighestWeightSendsEveryRequestToTheHeavierTemplate() throws Exception {
+        SlaveTemplate preferred = template("preferred", FIRST_TYPE, 10);
+        preferred.setHotSpareWeight(3);
+        SlaveTemplate fallback = template("fallback", SECOND_TYPE, 10);
+        fallback.setHotSpareWeight(1);
+        EC2Cloud cloud = cloud(true, preferred, fallback);
+        cloud.setSaturateHighestWeightFirst(true);
+
+        for (int i = 0; i < 4; i++) {
+            cloud.provision(Label.get(LABEL), 1);
+        }
+
+        assertThat(
+                awaitInstanceTypes(4),
+                contains(FIRST_TYPE.toString(), FIRST_TYPE.toString(), FIRST_TYPE.toString(), FIRST_TYPE.toString()));
+    }
+
+    /**
+     * ... and the lighter template is what the label falls back to once the heavier one can no
+     * longer supply an instance.
+     */
+    @Test
+    void testSaturatingHighestWeightFallsBackOnceTheHeavierTemplateIsExhausted() throws Exception {
+        SlaveTemplate preferred = template("preferred", FIRST_TYPE, 1);
+        preferred.setHotSpareWeight(3);
+        SlaveTemplate fallback = template("fallback", SECOND_TYPE, 10);
+        fallback.setHotSpareWeight(1);
+        EC2Cloud cloud = cloud(true, preferred, fallback);
+        cloud.setSaturateHighestWeightFirst(true);
+
+        // Synchronous, so the cap is genuinely reached before the label request below.
+        cloud.provision(preferred, 1);
+        assertThat(cloud.getAvailableCapacity(preferred), equalTo(0));
+
+        cloud.provision(Label.get(LABEL), 1);
+
+        assertThat(awaitInstanceTypes(2), contains(FIRST_TYPE.toString(), SECOND_TYPE.toString()));
+    }
+
+    /**
      * A rule for a label none of these templates carries must not disturb their provisioning.
      */
     @Test

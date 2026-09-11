@@ -261,6 +261,12 @@ public class EC2Cloud extends Cloud {
     private boolean roundRobinTemplatesByLabel;
 
     /**
+     * Whether the rotation treats a weight as a rank rather than as a share of the requests.
+     * Default {@code false}, which keeps the proportional rotation weights have always meant.
+     */
+    private boolean saturateHighestWeightFirst;
+
+    /**
      * Hot spare scaling rules, each owning the spare count for one label across every template
      * carrying it.
      */
@@ -462,6 +468,20 @@ public class EC2Cloud extends Cloud {
         this.roundRobinTemplatesByLabel = roundRobinTemplatesByLabel;
     }
 
+    /**
+     * @return whether the rotation exhausts the templates carrying the highest
+     *     {@link SlaveTemplate#getHotSpareWeight()} before it uses a lower one. When disabled, the
+     *     weights are shares of the requests and every weight keeps receiving some of them.
+     */
+    public boolean isSaturateHighestWeightFirst() {
+        return saturateHighestWeightFirst;
+    }
+
+    @DataBoundSetter
+    public void setSaturateHighestWeightFirst(boolean saturateHighestWeightFirst) {
+        this.saturateHighestWeightFirst = saturateHighestWeightFirst;
+    }
+
     @NonNull
     public List<HotSpareConfigByLabel> getHotSpareConfigsByLabel() {
         return hotSpareConfigsByLabel == null ? Collections.emptyList() : hotSpareConfigsByLabel;
@@ -582,7 +602,8 @@ public class EC2Cloud extends Cloud {
      */
     synchronized LabelTemplateRotation getRotation() {
         if (rotation == null) {
-            rotation = new LabelTemplateRotation(this::isRoundRobinTemplatesByLabel);
+            rotation =
+                    new LabelTemplateRotation(this::isRoundRobinTemplatesByLabel, this::isSaturateHighestWeightFirst);
         }
         return rotation;
     }
