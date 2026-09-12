@@ -1509,7 +1509,7 @@ public class EC2Cloud extends Cloud {
 
     /**
      * Provisions {@code number} instances from the label group, starting at {@code startIndex} and
-     * falling back to the next template when one cannot deliver.
+     * asking the next template for whatever the ones before it could not supply.
      *
      * <p>Failing over here rather than returning {@code null} is what makes a label provision as
      * fast as its fastest available instance type: an insufficient-capacity error used to cost a
@@ -1517,17 +1517,33 @@ public class EC2Cloud extends Cloud {
      * capacity error puts a template into the rotation cooldown; being at its instance cap or
      * failing for any other reason just moves on to the next candidate for this request.
      *
+     * <p>A template that delivers some of the request but not all of it is treated the same way as
+     * one that delivered nothing: the remainder is offered to the templates behind it, and the
+     * request is only short once the whole group has been asked. EC2 launches as many instances as
+     * it can rather than refusing a request it can only partly fill, and an instance type is a
+     * single spot pool, so a wide request routinely needs more than one of them.
+     *
      * @return the provisioned agents, or {@code null} if no template in the group could provide any.
      */
     private List<EC2AbstractSlave> provisionFromGroup(List<SlaveTemplate> ordered, int startIndex, int number) {
+        final List<EC2AbstractSlave> provisioned = new ArrayList<>();
         for (int i = startIndex; i < ordered.size(); i++) {
             final SlaveTemplate t = ordered.get(i);
+            final int remaining = number - provisioned.size();
             try {
-                List<EC2AbstractSlave> slaves = provisionFromTemplate(t, number);
+                List<EC2AbstractSlave> slaves = provisionFromTemplate(t, remaining);
                 if (slaves != null && !slaves.isEmpty()) {
-                    return slaves;
+                    provisioned.addAll(slaves);
+                    if (provisioned.size() >= number) {
+                        return provisioned;
+                    }
+                    LOGGER.log(
+                            Level.INFO,
+                            "{0}. Provisioned {1} of the {2} instance(s) asked for, offering the rest to the next template",
+                            new Object[] {t, slaves.size(), remaining});
+                } else {
+                    LOGGER.log(Level.INFO, "{0}. Provisioning returned no instances, trying next template", t);
                 }
-                LOGGER.log(Level.INFO, "{0}. Provisioning returned no instances, trying next template", t);
             } catch (AwsServiceException e) {
                 String errorCode =
                         e.awsErrorDetails() == null ? null : e.awsErrorDetails().errorCode();
@@ -1559,7 +1575,52 @@ public class EC2Cloud extends Cloud {
              */
             invalidateInstanceCountCache();
         }
-        return null;
+        return provisioned.isEmpty() ? null : provisioned;
+    }
+
+    /**
+     * Provisions up to {@code number} agents from an ordered group of templates and attaches them
+     * to Jenkins, taking what each template can deliver and asking the next one for the rest.
+     *
+     * <p>For callers that are not the {@link hudson.slaves.NodeProvisioner}, which attaches the
+     * nodes it planned itself. Warming hot spares goes through here so a label reaches its target
+     * within one pass, across as many instance types as it takes, rather than being limited to
+     * whatever the template at the head of its group happens to have.
+     *
+     * @return the number of agents provisioned and attached, which is less than {@code number} when
+     *     the group as a whole could not supply it.
+     */
+    @Restricted(NoExternalUse.class)
+    public int provisionAcrossGroup(@NonNull List<SlaveTemplate> ordered, int number) {
+        Jenkins jenkinsInstance = Jenkins.get();
+        if (jenkinsInstance.isQuietingDown()) {
+            LOGGER.log(Level.FINE, "Not provisioning nodes, Jenkins instance is quieting down");
+            return 0;
+        } else if (jenkinsInstance.isTerminating()) {
+            LOGGER.log(Level.FINE, "Not provisioning nodes, Jenkins instance is terminating");
+            return 0;
+        }
+
+        List<EC2AbstractSlave> slaves = provisionFromGroup(ordered, 0, number);
+        if (slaves == null || slaves.isEmpty()) {
+            return 0;
+        }
+
+        int attached = 0;
+        for (EC2AbstractSlave slave : slaves) {
+            if (slave == null) {
+                continue;
+            }
+            try {
+                attachSlavesToJenkins(
+                        jenkinsInstance, Collections.singletonList(slave), templateOf(slave, ordered.get(0)));
+                attached++;
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to attach " + slave.getNodeName(), e);
+            }
+        }
+        invalidateInstanceCountCache();
+        return attached;
     }
 
     /**

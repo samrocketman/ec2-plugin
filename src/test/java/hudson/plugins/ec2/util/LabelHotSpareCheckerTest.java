@@ -37,9 +37,12 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.StringJoiner;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import jenkins.model.Jenkins;
+import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
+import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -631,6 +634,88 @@ class LabelHotSpareCheckerTest {
         waitForAtLeastAgents(20);
         assertThat(countAgents(), equalTo(20));
         assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(20));
+    }
+
+    /**
+     * The same through a real {@code parallel} step rather than twenty separate jobs, because that
+     * is how a build of this shape actually reaches the queue: as twenty placeholder tasks of one
+     * build, each asking for the label its {@code node} step named. The width has to be read off
+     * those tasks, or the fan-out that most needs capacity is the one the label cannot see.
+     */
+    @Test
+    void testARealParallelBuildWarmsTheLabelToItsWholeWidth() throws Exception {
+        HotSpareConfigByLabel rule = rule(0, 5, null);
+        EC2Cloud cloud = cloud(rule, template("only", 30));
+
+        r.jenkins.setQuietPeriod(0);
+        parallelBuildAcross(20, LABEL);
+
+        waitForAtLeastAgents(20);
+        assertThat(countAgents(), equalTo(20));
+        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(20));
+    }
+
+    /**
+     * Warm capacity already in hand is part of the width, not additional to it. Five idle spares
+     * and a build fanning out to twenty branches is fifteen instances to launch: the label ends up
+     * holding twenty, having paid for fifteen.
+     */
+    @Test
+    void testSparesAlreadyHeldCountTowardsTheWidthOfAParallelBuild() throws Exception {
+        HotSpareConfigByLabel rule = rule(0, 5, null);
+        EC2Cloud cloud = cloud(rule, template("only", 30));
+
+        // A label that has already learned it wants five, and is holding them.
+        HotSpareDemand.of(cloud, LABEL).updateTarget(rule, 0, 0, 5, 0);
+        MinimumInstanceChecker.checkForMinimumInstances();
+        assertThat(countAgents(), equalTo(5));
+        int launchedForTheFirstFive = AmazonEC2FactoryMockImpl.instances.size();
+
+        r.jenkins.setQuietPeriod(0);
+        parallelBuildAcross(20, LABEL);
+        waitForAtLeastAgents(20);
+
+        assertThat(countAgents(), equalTo(20));
+        assertThat(HotSpareDemand.of(cloud, LABEL).getTarget(), equalTo(20));
+        assertThat(
+                "the five already warm were not provisioned again",
+                AmazonEC2FactoryMockImpl.instances.size(),
+                equalTo(launchedForTheFirstFive + 15));
+    }
+
+    /**
+     * A parallel build of one label says nothing about another label of the same rule, however wide
+     * it is: twenty x86 branches are twenty x86 agents and no arm64 ones.
+     */
+    @Test
+    void testAParallelBuildOnlyWarmsTheLabelItsBranchesAskedFor() throws Exception {
+        EC2Cloud cloud = cloud(
+                rule("x86_64_medium_pr || arm64_medium_pr", 0, 5),
+                template("x86", 30, "x86_64_medium_pr"),
+                template("arm", 30, "arm64_medium_pr"));
+
+        r.jenkins.setQuietPeriod(0);
+        parallelBuildAcross(20, "x86_64_medium_pr");
+
+        waitForAtLeastAgents(20);
+        assertThat(agentsByTemplate(), equalTo(Map.of("x86", 20L)));
+        assertThat(HotSpareDemand.of(cloud, "x86_64_medium_pr").getTarget(), equalTo(20));
+        assertThat(HotSpareDemand.of(cloud, "arm64_medium_pr").getTarget(), equalTo(0));
+    }
+
+    /**
+     * Starts a build that fans out to the given number of branches, each asking for the label, and
+     * waits until every branch is in the queue waiting for an agent.
+     */
+    private void parallelBuildAcross(int branches, String label) throws Exception {
+        StringJoiner script = new StringJoiner(", ", "parallel ", "");
+        for (int branch = 0; branch < branches; branch++) {
+            script.add("branch" + branch + ": { node('" + label + "') { } }");
+        }
+        WorkflowJob job = r.createProject(WorkflowJob.class, "fan-out-" + label.hashCode());
+        job.setDefinition(new CpsFlowDefinition(script.toString(), true));
+        job.scheduleBuild2(0);
+        waitForBuildableItems(branches);
     }
 
     private void removeAllAgents() throws Exception {

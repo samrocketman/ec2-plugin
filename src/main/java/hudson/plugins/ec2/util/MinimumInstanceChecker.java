@@ -535,41 +535,47 @@ public class MinimumInstanceChecker {
 
     /**
      * Spreads a shortfall over the templates of a label group, in rotation order so hot spare
-     * weights apply, and never beyond what a template's instance cap allows. A template at its cap,
-     * or outside the time range it is configured to hold instances in, is skipped for this round and
-     * its share is offered to the templates that can take it.
+     * weights apply.
+     *
+     * <p>The whole shortfall is handed to the group as one request, so what the leading template
+     * cannot supply is asked of the ones behind it before the pass gives up. That matters most for
+     * the case the spares exist for: a template is a single spot pool and EC2 fills a request for
+     * twenty with however many it has, so a burst that one pool cannot cover is met from the next
+     * one in cost order within the same pass instead of a pool's worth per minute. A template out
+     * of capacity is also put into the rotation cooldown, the same as for a label request, so the
+     * next pass leads with one that can deliver.
+     *
+     * <p>A template outside the time range it is configured to hold instances in is left out of the
+     * request altogether: its schedule is how an admin pays for capacity only when it is wanted.
      */
     private static void provisionAcrossLabelGroup(
             @NonNull EC2Cloud cloud, @NonNull Label label, @NonNull Collection<SlaveTemplate> matching, int toLaunch) {
+        List<SlaveTemplate> onDuty = new ArrayList<>();
         for (SlaveTemplate template : cloud.orderTemplatesForLabel(label, matching)) {
-            if (toLaunch <= 0) {
-                return;
-            }
-            if (!keepsWarmInstancesNow(template)) {
+            if (keepsWarmInstancesNow(template)) {
+                onDuty.add(template);
+            } else {
                 LOGGER.log(
                         Level.FINE,
                         "{0} is outside the time range it keeps instances in, offering its hot spares to the next template",
                         template);
-                continue;
             }
-            int headroom = cloud.getAvailableCapacity(template);
-            if (headroom <= 0) {
-                LOGGER.log(
-                        Level.FINE,
-                        "{0} is at its instance cap, offering its hot spares to the next template",
-                        template);
-                continue;
-            }
-            int number = Math.min(toLaunch, headroom);
-            cloud.provision(template, number);
-            toLaunch -= number;
         }
-        if (toLaunch > 0) {
+        if (onDuty.isEmpty()) {
             LOGGER.log(
                     Level.FINE,
-                    "{0} hot spare(s) for label {1} were not provisioned: every template is at its instance cap or "
-                            + "outside the time range it keeps instances in",
-                    new Object[] {toLaunch, label.getName()});
+                    "No template of label {0} is holding instances at the moment, so its {1} hot spare(s) wait",
+                    new Object[] {label.getName(), toLaunch});
+            return;
+        }
+
+        int launched = cloud.provisionAcrossGroup(onDuty, toLaunch);
+        if (launched < toLaunch) {
+            LOGGER.log(
+                    Level.FINE,
+                    "{0} of {1} hot spare(s) for label {2} were not provisioned: every template of the group is at "
+                            + "its instance cap, out of capacity, or outside the time range it keeps instances in",
+                    new Object[] {toLaunch - launched, toLaunch, label.getName()});
         }
     }
 
